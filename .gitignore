@@ -1,0 +1,10 @@
+media/
+# Binary built by `go build` at the repo root. Scoped with a leading
+# slash so it doesn't shadow cmd/easycampus/ (the entry point).
+/easycampus
+# Make build output. `make build` drops the binary into ./bin/.
+/bin/
+.env
+*.log
+# Claude Code worktree scratch dir (used by isolated agents).
+.claude/

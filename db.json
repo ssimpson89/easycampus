@@ -1,0 +1,26 @@
+{
+  "events": [
+    {
+      "id": "1771372045172155000",
+      "type": "upload",
+      "name": "New video uploaded: bbb_sunflower_1080p_60fps_normal.mp4",
+      "created_at": "2026-02-17T17:47:25.17216-06:00",
+      "duration_seconds": 0,
+      "size_bytes": 0,
+      "status": "",
+      "fps": 0,
+      "data": {
+        "filename": "bbb_sunflower_1080p_60fps_normal.mp4",
+        "path": "media/1771372045_bbb_sunflower_1080p_60fps_normal.mp4",
+        "quality": "standard"
+      }
+    }
+  ],
+  "bookmarks": [],
+  "settings": {
+    "mode": "",
+    "last_input_id": "",
+    "bitrate": 5000,
+    "framerate": 30
+  }
+}

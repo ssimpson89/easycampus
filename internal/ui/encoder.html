@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EasyCampus Encoder</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <link rel="icon" type="image/svg+xml"
+        href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230b1018'/%3E%3Cpath d='M5 4 L12 8 L5 12 Z' fill='%23f59e0b'/%3E%3C/svg%3E">
+  <!-- Helpers first, then the Alpine component, then Alpine itself.
+       alpine:init must register before Alpine boots. -->
+  <script src="/assets/hls.min.js"      defer></script>
+  <script src="/assets/format.js"       defer></script>
+  <script src="/assets/encoder.js"      defer></script>
+  <script src="/assets/alpine.min.js"   defer></script>
+</head>
+<body x-data="encoder" :class="{ 'is-live': isLive }" x-cloak>
+
+  <a href="#main" class="skip-link">Skip to main content</a>
+
+  <!-- =============== LIVE BANNER =============== -->
+  <div class="banner live" x-show="isLive" role="status" aria-live="polite">
+    <div class="banner-left">
+      <span class="live-dot" aria-hidden="true"></span>
+      <span class="banner-label">LIVE</span>
+      <span class="banner-uptime tabular" x-text="liveUptime"></span>
+    </div>
+    <div class="banner-center" x-text="liveHeadline"></div>
+    <div class="banner-right">
+      <button class="banner-btn banner-stop" x-show="!stopConfirm" @click="showStopConfirm()">Stop</button>
+      <button class="banner-btn banner-confirm" x-show="stopConfirm" @click="confirmStop()" x-ref="confirmStop">Confirm stop</button>
+      <button class="banner-btn" x-show="stopConfirm" @click="stopConfirm = false">Cancel</button>
+    </div>
+  </div>
+
+  <main class="shell" id="main">
+
+    <!-- =============== TOPBAR =============== -->
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 4 L19 12 L4 20 Z" fill="currentColor"/>
+        </svg>
+        <h1>EasyCampus <span class="brand-sub">Encoder</span></h1>
+      </div>
+      <div class="topbar-right">
+        <span class="conn-pill" :class="connectionOK ? 'ok' : 'warn'"
+              x-text="connectionOK ? 'Connected' : 'Reconnecting…'"></span>
+        <span class="pill" :class="isLive ? 'live' : 'idle'" x-text="isLive ? 'Encoding' : 'Idle'"></span>
+      </div>
+    </header>
+
+    <!-- =============== ERROR BANNER =============== -->
+    <div class="panel" x-show="error" x-cloak
+         style="border-color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, var(--panel)); margin-bottom: 16px;"
+         role="alert">
+      <div class="row-between" style="gap: 12px;">
+        <span style="color: var(--bad); font-weight: 600;" x-text="error"></span>
+        <button class="button button-sm" @click="error = ''">Dismiss</button>
+      </div>
+    </div>
+
+    <!-- =============== HERO + PREVIEW =============== -->
+    <div class="grid-2" style="margin-bottom: 20px;">
+
+      <!-- ---------- HERO: idle (event setup) ---------- -->
+      <section class="panel panel-hero" x-show="!isLive">
+        <p class="eyebrow">Ready to record</p>
+        <h2 x-text="eventName || 'Set up your broadcast'"></h2>
+        <p class="hint" style="margin-top: 6px;">
+          Configure the event, pick a capture device, then start streaming. The encoder
+          writes HLS segments locally and (when configured) publishes them for decoders to play.
+        </p>
+
+        <div style="margin-top: 18px;" class="stack-sm">
+          <div>
+            <label for="event-name">Event name</label>
+            <input id="event-name" type="text" x-model="eventName"
+                   placeholder="e.g. Sunday Morning Service"
+                   :disabled="isLive">
+          </div>
+
+          <div class="form-row">
+            <div>
+              <label for="input-source">Video input</label>
+              <select id="input-source" x-model="selectedInput" :disabled="isLive">
+                <template x-for="d in inputs" :key="d.id">
+                  <option :value="d.id" x-text="d.name"></option>
+                </template>
+                <option value="" x-show="inputs.length === 0">No capture devices found</option>
+              </select>
+              <span class="field-help" x-show="inputs.length === 0">
+                Connect a camera or capture card, then click <em>Refresh</em>.
+              </span>
+            </div>
+            <div>
+              <label for="quality-preset">Quality</label>
+              <select id="quality-preset" x-model="selectedPreset" :disabled="isLive">
+                <template x-for="t in qualityTiers" :key="t.tier">
+                  <optgroup :label="t.label">
+                    <template x-for="p in t.presets" :key="p.id">
+                      <option :value="p.id" x-text="`${p.label} · ${presetSubline(p)}`"></option>
+                    </template>
+                  </optgroup>
+                </template>
+              </select>
+              <span class="field-help" x-text="currentPreset ? presetSubline(currentPreset) : 'Pick a quality tier'"></span>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top: 14px;">
+            <button class="button button-sm" @click="fetchInputs()">Refresh devices</button>
+            <span class="hint" x-text="inputs.length === 1
+              ? '1 capture device available.'
+              : `${inputs.length} capture devices available.`"></span>
+          </div>
+        </div>
+
+        <div style="margin-top: 22px;">
+          <button class="primary-action" :disabled="!canStart" @click="startStream()">
+            <span x-show="!isStarting">Start streaming</span>
+            <span x-show="isStarting">Starting…</span>
+          </button>
+        </div>
+      </section>
+
+      <!-- ---------- HERO: live ---------- -->
+      <section class="panel panel-hero" x-show="isLive" style="border-color: color-mix(in srgb, var(--live-red) 35%, var(--line));">
+        <p class="eyebrow">Now encoding</p>
+        <h2 x-text="liveHeadline"></h2>
+        <p class="hint" style="margin-top: 6px;">
+          Live for <span class="tabular" x-text="liveUptime"></span>
+          <span x-show="stream.event_id"> · Event ID <code x-text="stream.event_id"></code></span>
+        </p>
+
+        <div class="metrics" style="margin-top: 18px;">
+          <div>
+            <dt>State</dt>
+            <dd style="color: var(--good);">Encoding</dd>
+          </div>
+          <div>
+            <dt>Preset</dt>
+            <dd x-text="currentPreset?.label || '—'"></dd>
+          </div>
+          <div>
+            <dt>Bitrate</dt>
+            <dd x-text="currentPreset ? ((currentPreset.video_bitrate_kbps / 1000).toFixed(currentPreset.video_bitrate_kbps % 1000 === 0 ? 0 : 1) + ' Mbps') : '—'"></dd>
+          </div>
+          <div>
+            <dt>FPS</dt>
+            <dd x-text="currentPreset?.fps || '—'"></dd>
+          </div>
+        </div>
+
+        <p class="hint" x-show="stream.last_error" style="margin-top: 14px; color: var(--warn);">
+          Last error: <span x-text="stream.last_error"></span>
+        </p>
+      </section>
+
+      <!-- ---------- LOCAL CAMERA PREVIEW ---------- -->
+      <section class="panel">
+        <div class="row-between" style="margin-bottom: 12px;">
+          <p class="eyebrow">Camera preview</p>
+          <button class="button-ghost" @click="cameraReady ? stopCamera() : initCamera()" x-text="cameraReady ? 'Stop preview' : 'Start preview'"></button>
+        </div>
+        <div class="video-stage">
+          <video x-ref="cameraVideo" autoplay muted playsinline aria-label="Local camera preview"></video>
+
+          <div class="video-overlay" x-show="!cameraReady && !cameraLoading" x-cloak>
+            <div class="video-overlay-stack">
+              <button class="button button-primary button-lg" @click="initCamera()">Start camera preview</button>
+              <p>Optional. Uses your browser's media permissions; nothing is uploaded by the preview itself.</p>
+            </div>
+          </div>
+
+          <div class="video-overlay" x-show="cameraLoading" x-cloak>
+            <p>Starting camera…</p>
+          </div>
+
+          <span class="video-badge left" x-show="cameraReady" x-cloak>Local preview</span>
+        </div>
+        <p class="field-help" x-show="cameraError" x-cloak style="color: var(--warn);" x-text="cameraError"></p>
+      </section>
+    </div>
+
+    <!-- =============== PRE-FLIGHT =============== -->
+    <section class="panel" style="margin-bottom: 20px;" x-show="!isLive" aria-label="Pre-flight check">
+      <p class="eyebrow" style="margin-bottom: 12px;">Pre-flight</p>
+      <div class="stack-sm">
+        <template x-for="row in preflightRows" :key="row.label">
+          <div class="row" style="padding: 8px 0; border-bottom: 1px solid var(--line);">
+            <span class="pill-dot" :class="row.status === 'good' ? 'good' : row.status === 'warn' ? 'warn' : row.status === 'bad' ? 'bad' : ''"
+                  aria-hidden="true"></span>
+            <div style="flex: 1; min-width: 0;">
+              <strong x-text="row.label"></strong>
+              <div class="hint" x-text="row.detail"></div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- =============== UPLOAD + EXTERNAL SOURCE =============== -->
+    <div class="grid-2" style="margin-bottom: 20px;">
+      <!-- Upload -->
+      <section class="panel">
+        <h2>Upload a video</h2>
+        <p class="hint">Upload an existing MP4 / MKV / MOV and we'll transcode it into the same HLS shape we produce live. Quality follows the preset selected above.</p>
+
+        <input type="file" id="fileInput" x-ref="fileInput"
+               accept="video/*,.mkv,.mp4,.mov,.avi,.webm" hidden
+               @change="onFileChosen($event)">
+
+        <div class="upload-zone" style="margin-top: 16px;">
+          <button class="button button-primary button-lg button-full" @click="pickFile()" :disabled="!!uploadStatus && uploadStatus !== 'Failed' && uploadStatus !== 'Ready'">
+            <span x-show="!uploadStatus || uploadStatus === 'Failed' || uploadStatus === 'Ready'">Choose video file</span>
+            <span x-show="uploadStatus && uploadStatus !== 'Failed' && uploadStatus !== 'Ready'" x-text="uploadStatus"></span>
+          </button>
+
+          <div x-show="uploadStatus" x-cloak>
+            <div class="progress-row">
+              <span x-text="uploadStatus"></span>
+              <span x-show="uploadEventId" class="mono" x-text="uploadEventId"></span>
+            </div>
+            <div class="progress">
+              <div class="progress-bar good" :style="`width: ${uploadProgress}%`"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- External source -->
+      <section class="panel">
+        <h2>Pull from URL</h2>
+        <p class="hint">Fetch a remote video (MP4 / HLS / etc.) and ingest it as an event. Useful for guest sermons or imports.</p>
+
+        <div style="margin-top: 16px;">
+          <label for="ext-name">Source name</label>
+          <input id="ext-name" type="text" x-model="extName" placeholder="e.g. Guest Sermon">
+
+          <label for="ext-url">Source URL</label>
+          <input id="ext-url" type="url" x-model="extUrl"
+                 placeholder="https://example.com/video.mp4 or .m3u8" autocomplete="off">
+
+          <div class="form-actions">
+            <button class="button button-primary" @click="addExternalSource()"
+                    :disabled="extLoading || !extName.trim() || !extUrl.trim()">
+              <span x-show="!extLoading">Add source</span>
+              <span x-show="extLoading" x-text="extStatus || 'Working…'"></span>
+            </button>
+            <span class="hint" x-show="extStatus && !extLoading" x-text="extStatus"></span>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- =============== EVENT HISTORY =============== -->
+    <section class="panel" style="margin-bottom: 20px;">
+      <div class="row-between" style="margin-bottom: 12px;">
+        <div>
+          <h2>Event history</h2>
+          <p class="hint">Select an event to preview, scrub, and bookmark frames.</p>
+        </div>
+        <button class="button button-sm" @click="loadEvents()">Refresh</button>
+      </div>
+
+      <div x-show="events.length === 0" class="empty-card" x-cloak>
+        <p>No events yet</p>
+        <p class="hint">Your first stream, upload, or pulled URL will appear here.</p>
+      </div>
+
+      <div class="event-list" x-show="events.length > 0" x-cloak>
+        <template x-for="ev in events" :key="ev.id">
+          <div class="event-card" :class="{ active: selectedEvent?.id === ev.id }">
+            <button class="event-card-body" @click="selectEventForPreview(ev)">
+              <span class="event-card-icon" :class="eventIcon(ev)">
+                <svg x-show="eventIcon(ev) === 'recording'" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>
+                <svg x-show="eventIcon(ev) === 'upload'"   width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+                <svg x-show="eventIcon(ev) === 'local'"    width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M4 14v3a2 2 0 002 2h12a2 2 0 002-2v-3M8 9l4-4 4 4M12 5v12"/></svg>
+                <svg x-show="eventIcon(ev) === 'standard'" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20 6 4"/></svg>
+              </span>
+              <span class="event-card-info">
+                <span class="event-card-title">
+                  <span class="event-card-title-text" x-text="ev.name"></span>
+                  <span class="pill live" x-show="ev.status === 'running'">Live</span>
+                </span>
+                <span class="event-card-meta">
+                  <span x-text="fmtDate(ev.created_at)"></span>
+                  <span class="mono tabular" x-text="fmtTime(ev.duration_seconds)"></span>
+                  <span x-text="fmtBytes(ev.size_bytes)"></span>
+                </span>
+              </span>
+            </button>
+            <span class="event-card-actions">
+              <button class="icon-btn" @click="deleteEvent(ev)" :disabled="ev.status === 'running'" :title="ev.status === 'running' ? 'Cannot delete a live event' : 'Delete event'" aria-label="Delete event">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                  <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m2 0v14a2 2 0 01-2 2H8a2 2 0 01-2-2V6"/>
+                </svg>
+              </button>
+            </span>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- =============== EVENT PREVIEW (only when an event is selected) =============== -->
+    <section class="panel" x-show="selectedEvent" x-cloak style="margin-bottom: 20px;">
+      <div class="row-between" style="margin-bottom: 12px;">
+        <div>
+          <p class="eyebrow">Preview</p>
+          <h2 x-text="selectedEvent?.name"></h2>
+        </div>
+        <span class="pill" :class="selectedEvent?.status === 'running' ? 'live' : 'info'"
+              x-text="selectedEvent?.status === 'running' ? 'Live event' : 'Recorded'"></span>
+      </div>
+
+      <div class="video-stage" style="margin-bottom: 14px;">
+        <video x-ref="previewVideo" playsinline muted
+               @timeupdate="onPreviewTimeUpdate($event)"
+               @loadedmetadata="onPreviewLoadedMeta($event)"
+               @durationchange="onPreviewDurationChange($event)"
+               @play="onPreviewPlay()" @pause="onPreviewPause()"></video>
+        <span class="video-badge left" x-show="previewLive" x-cloak>Live edge</span>
+      </div>
+
+      <!-- Transport row -->
+      <div class="transport" style="margin-bottom: 12px;">
+        <button class="play-btn" @click="togglePreviewPlay()" :disabled="!previewReady" :aria-label="previewPlaying ? 'Pause' : 'Play'">
+          <svg x-show="!previewPlaying" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          <svg x-show="previewPlaying"  width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>
+        </button>
+        <div class="player-time">
+          <span class="now tabular"   x-text="fmtTime(previewTime)"></span>
+          <span class="total tabular" x-text="'/ ' + fmtTime(previewDuration)"></span>
+        </div>
+        <div class="row" style="margin-left: auto; gap: 8px;">
+          <input type="text" x-model="previewSeek" placeholder="00:05:23" style="width: 110px;" class="mono"
+                 @keydown.enter.prevent="previewGoto()">
+          <button class="button button-sm" @click="previewGoto()">Go to</button>
+        </div>
+      </div>
+
+      <!-- Scrubber + bookmark marks -->
+      <div class="scrubber" style="margin-bottom: 12px;">
+        <div class="scrubber-bookmarks" aria-hidden="true">
+          <template x-for="b in bookmarks" :key="b.id">
+            <button class="scrubber-bookmark" :class="b.source === 'decoder' ? 'decoder' : 'encoder'"
+                    :style="`left: ${bookmarkLeft(b)};`"
+                    :title="`${b.name} (${fmtTime(b.time_pos)})`"
+                    @click.prevent="jumpToBookmark(b)"></button>
+          </template>
+        </div>
+        <input type="range" min="0" :max="previewDuration || 100" step="0.01"
+               :value="previewTime"
+               :style="`--scrub: ${scrubFill()}`"
+               @input="onPreviewScrub($event)"
+               :disabled="!previewReady"
+               aria-label="Preview position">
+      </div>
+
+      <!-- Jog row -->
+      <div class="jog-row" style="margin-bottom: 14px;">
+        <button class="jog-btn frame" @click="previewFrameStep(-1)" :disabled="!previewReady" title="Previous frame">◀ Frame</button>
+        <button class="jog-btn" @click="previewJump(-30)" :disabled="!previewReady">−30s</button>
+        <button class="jog-btn" @click="previewJump(-5)"  :disabled="!previewReady">−5s</button>
+        <button class="jog-btn" @click="previewJump(-1)"  :disabled="!previewReady">−1s</button>
+        <button class="jog-btn" @click="previewJump(1)"   :disabled="!previewReady">+1s</button>
+        <button class="jog-btn" @click="previewJump(5)"   :disabled="!previewReady">+5s</button>
+        <button class="jog-btn" @click="previewJump(30)"  :disabled="!previewReady">+30s</button>
+        <button class="jog-btn frame" @click="previewFrameStep(1)" :disabled="!previewReady" title="Next frame">Frame ▶</button>
+      </div>
+
+      <!-- Bookmarks -->
+      <h3 class="section-heading-2">Bookmarks</h3>
+      <p class="hint" style="margin-bottom: 10px;">Bookmarks are shared with the decoder so frame-accurate cues survive the trip from encoder to projector.</p>
+
+      <div class="panel-sub" style="margin-bottom: 12px;">
+        <div class="row" style="gap: 8px;">
+          <input type="text" x-model="newBookmarkName" placeholder="Optional name. Defaults to frame number." @keydown.enter.prevent="createBookmark()">
+          <button class="button button-primary" @click="createBookmark()" :disabled="!selectedEvent">Mark here</button>
+        </div>
+      </div>
+
+      <div x-show="bookmarks.length === 0" class="empty-line" x-cloak>No bookmarks yet. Scrub to a frame and click Mark here.</div>
+      <div x-show="bookmarks.length > 0" x-cloak>
+        <template x-for="b in bookmarks" :key="b.id">
+          <div class="bookmark-row">
+            <div class="bookmark-row-info">
+              <span class="bookmark-tag" :class="b.source === 'decoder' ? 'decoder' : 'encoder'" aria-hidden="true"></span>
+              <div>
+                <div class="bookmark-name" x-text="b.name"></div>
+                <div class="bookmark-time">Frame <span class="mono tabular" x-text="b.frame"></span> · <span class="tabular" x-text="fmtTime(b.time_pos)"></span></div>
+              </div>
+            </div>
+            <div class="bookmark-actions">
+              <button class="button button-sm" @click="jumpToBookmark(b)">Jump</button>
+              <button class="button button-sm button-danger" @click="deleteBookmark(b)">Delete</button>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Toast -->
+  <div class="toast" :class="[toast ? 'visible' : '', toastKind]" role="status" aria-live="polite" x-text="toast"></div>
+
+</body>
+</html>

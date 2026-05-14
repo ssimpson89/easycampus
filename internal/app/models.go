@@ -163,12 +163,22 @@ type EventInfo struct {
 
 type HealthStatus struct {
 	OK                bool         `json:"ok"`
+	Version           VersionInfo  `json:"version"`
 	FFMpegAvailable   bool         `json:"ffmpeg_available"`
 	InputFormat       string       `json:"input_format"`
 	InputDevice       string       `json:"input_device"`
 	EventsDir         string       `json:"events_dir"`
 	EventsDirWritable bool         `json:"events_dir_writable"`
 	Stream            StreamStatus `json:"stream"`
+}
+
+// VersionInfo is the API-facing shape of build identity (see
+// internal/version). Lives here to keep internal/app free of the
+// version-package import — handlers compose it from version.Current.
+type VersionInfo struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit,omitempty"`
+	Date    string `json:"date,omitempty"`
 }
 
 type ForceStopRequest struct {

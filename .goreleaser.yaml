@@ -1,0 +1,55 @@
+version: 2
+
+project_name: easycampus
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: easycampus
+    main: ./cmd/easycampus
+    binary: easycampus
+    env:
+      - CGO_ENABLED=0
+    # macOS + Linux only. Windows is excluded until the architect's
+    # mpv.go Windows liveness probe TODO is closed and we have a real
+    # smoke test on a Windows host.
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - >-
+        -s -w
+        -X easycampus/internal/version.Version={{ .Version }}
+        -X easycampus/internal/version.Commit={{ .Commit }}
+        -X easycampus/internal/version.Date={{ .Date }}
+
+archives:
+  - id: easycampus
+    ids:
+      - easycampus
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

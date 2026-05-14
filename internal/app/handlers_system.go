@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+
+	"easycampus/internal/version"
 )
 
 func (s *Server) handleInputs(w http.ResponseWriter, r *http.Request) {
@@ -30,8 +32,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if info, err := os.Stat(s.settings.EventsDir); err == nil && info.IsDir() {
 		writable = true
 	}
+	v := version.Current()
 	response := HealthStatus{
 		OK:                true,
+		Version:           VersionInfo{Version: v.Version, Commit: v.Commit, Date: v.Date},
 		FFMpegAvailable:   s.ffmpeg.FFMpegAvailable(ctx),
 		InputFormat:       s.settings.InputFormat,
 		InputDevice:       s.settings.InputDevice,

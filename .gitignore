@@ -8,3 +8,4 @@ media/
 *.log
 # Claude Code worktree scratch dir (used by isolated agents).
 .claude/
+dist/

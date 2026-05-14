@@ -21,6 +21,7 @@ import (
 	"syscall"
 
 	"easycampus/internal/app"
+	"easycampus/internal/version"
 )
 
 func main() {
@@ -76,10 +77,13 @@ func main() {
 		syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	v := version.Current()
 	logger.Info("easycampus starting",
 		"addr", server.Addr(),
 		"node_type", settings.NodeType,
-		"version", versionString())
+		"version", v.Version,
+		"commit", v.Commit,
+		"date", v.Date)
 	if err := server.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("server exited with error", "err", err)
 		os.Exit(1)
@@ -130,11 +134,3 @@ func parseLogLevel(s string) slog.Level {
 	return slog.LevelInfo
 }
 
-// versionString returns a best-effort version banner. Today we don't
-// embed git info; later this can be linked in via -ldflags.
-func versionString() string {
-	if v := os.Getenv("EASYCAMPUS_VERSION"); v != "" {
-		return v
-	}
-	return "dev"
-}

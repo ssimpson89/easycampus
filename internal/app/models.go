@@ -1,6 +1,10 @@
 package app
 
-import "time"
+import (
+	"time"
+
+	"easycampus/internal/version"
+)
 
 type StreamConfig struct {
 	EventName         string `json:"event_name"`
@@ -163,6 +167,7 @@ type EventInfo struct {
 
 type HealthStatus struct {
 	OK                bool         `json:"ok"`
+	Version           version.Info `json:"version"`
 	FFMpegAvailable   bool         `json:"ffmpeg_available"`
 	InputFormat       string       `json:"input_format"`
 	InputDevice       string       `json:"input_device"`

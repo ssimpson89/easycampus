@@ -154,12 +154,25 @@ func (m *MPVService) Start(ctx context.Context, url string, screenIndex int, pro
 		)
 	}
 
-	// exec.CommandContext lets a parent ctx cancellation reap the
-	// child. Note: a nil ctx would panic, so fall back to Background.
+	// The mpv child must outlive the HTTP request that started it —
+	// it's a long-running decoder, not a one-shot. exec.CommandContext
+	// kills the process when the supplied ctx is done, so wiring the
+	// request ctx straight in would mean Go kills mpv the instant the
+	// /output/start handler returns 200. Visible symptom: every
+	// subsequent IPC call (seek, pause, status) gets "connection
+	// refused" on the unix socket within milliseconds of a successful
+	// start. Mirrors FFmpegService.StartStream which uses
+	// context.WithoutCancel for the same reason.
+	//
+	// ctx is still used above for: preflight cancellation, stopping
+	// the previous mpv (m.Stop(ctx)), and the IPC socket wait
+	// (waitForMPVSocket). It just doesn't own mpv's lifetime — that's
+	// MPVService.Stop's job.
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cmd := exec.CommandContext(ctx, "mpv", args...)
+	spawnCtx := context.WithoutCancel(ctx)
+	cmd := exec.CommandContext(spawnCtx, "mpv", args...)
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil

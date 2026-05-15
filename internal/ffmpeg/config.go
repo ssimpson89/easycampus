@@ -414,7 +414,23 @@ func (c Config) EffectiveEncoder() Encoder {
 // EffectiveHWAccel returns the input hwaccel decision. Pass the encoder
 // you'll use so we can match them (videotoolbox decode + videotoolbox
 // encode skips a CPU roundtrip). Detection is cached per process.
+//
+// Uploads (ModeUpload) always return HWAccelNone regardless of config:
+// upload sources are arbitrary user files (AV1/VP9/HEVC from OBS, screen
+// recordings, exotic broadcast captures). Hardware decoders advertise
+// support they can't actually deliver — videotoolbox in particular
+// claims AV1 on Apple Silicon, then fails every frame with "Function
+// not implemented" and ffmpeg aborts at the decode-error-rate ceiling.
+// Software decode covers every codec ffmpeg's libav builds support, and
+// upload latency is irrelevant (batch job). The encode side still
+// picks hwaccel via the encoder selection — only input decode is
+// pinned to software for uploads. Live capture (ModeLiveHLS) keeps
+// hwaccel because the input is always camera-native (raw or H.264) and
+// latency matters.
 func (c Config) EffectiveHWAccel(encoder Encoder) HWAccel {
+	if c.Mode == ModeUpload {
+		return HWAccelNone
+	}
 	if c.HWAccel == HWAccelNone {
 		return HWAccelNone
 	}

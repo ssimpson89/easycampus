@@ -1,13 +1,16 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -183,7 +186,7 @@ func (s *Server) handleUploadStatus(w http.ResponseWriter, r *http.Request) {
 		s.reconcileJobStatus(&info, eventDir, infoPath)
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{"event_id": eventID, "status": info.Status, "name": info.Name, "type": info.Type, "progress": 0})
+	s.writeJSON(w, http.StatusOK, uploadStatusPayload(eventID, info))
 }
 
 func (s *Server) handleCacheUpload(w http.ResponseWriter, r *http.Request) {
@@ -277,7 +280,7 @@ func (s *Server) handleCacheUploadStatus(w http.ResponseWriter, r *http.Request)
 		s.reconcileJobStatus(&info, eventDir, infoPath)
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{"event_id": eventID, "status": info.Status, "name": info.Name, "type": info.Type, "progress": 0})
+	s.writeJSON(w, http.StatusOK, uploadStatusPayload(eventID, info))
 }
 
 func (s *Server) handleCacheUploads(w http.ResponseWriter, r *http.Request) {
@@ -432,26 +435,76 @@ func (s *Server) handleExternalSourceStatus(w http.ResponseWriter, r *http.Reque
 		s.reconcileJobStatus(&info, eventDir, infoPath)
 	}
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{"event_id": eventID, "status": info.Status, "name": info.Name, "type": info.Type, "progress": 0})
+	s.writeJSON(w, http.StatusOK, uploadStatusPayload(eventID, info))
+}
+
+// uploadStatusPayload assembles the JSON response for the three upload
+// status endpoints (handleUploadStatus, handleCacheUploadStatus, and the
+// per-id branch of handleCacheUploads). Centralising means the on-wire
+// schema stays in lockstep — the encoder UI's poll path doesn't have to
+// special-case which upload kind it's looking at.
+//
+// "progress" is a structured block (percent, frame, fps, speed, ...) when
+// ffmpeg has emitted at least one -progress tick, otherwise null. The UI
+// renders an indeterminate bar on null/missing, a real bar on percent>=0,
+// and a frame/fps readout on percent==-1 (duration probe failed).
+func uploadStatusPayload(eventID string, info EventInfoFile) map[string]interface{} {
+	return map[string]interface{}{
+		"event_id":             eventID,
+		"status":               info.Status,
+		"name":                 info.Name,
+		"type":                 info.Type,
+		"progress":             info.Progress, // nil ⇒ JSON null, populated ⇒ struct
+		"source_duration_secs": info.SourceDurationSecs,
+	}
 }
 
 // startUploadConversion spawns a one-shot HLS conversion via the internal
-// Job runner. The status callback updates info.json when ffmpeg exits.
+// Job runner. Two callbacks are wired:
+//
+//   - OnProgress writes the current ffmpeg -progress block (frame, fps,
+//     speed, out_time_us) into info.json's "progress" key so the encoder
+//     UI's poll of /api/(cache|events)/upload/{id}/status surfaces a
+//     real progress bar instead of "processing...".
+//   - OnComplete flips status to "completed" or "failed" once ffmpeg
+//     exits and clears the pid field.
+//
+// Source duration is probed via ffprobe before the conversion starts;
+// it's stored alongside the progress block so the UI can compute a
+// percentage. Probe failure isn't fatal — the UI falls back to an
+// indeterminate bar driven by frame/fps/speed.
 //
 // Replaces the previous bare exec.Command("ffmpeg", ...) implementation;
 // every ffmpeg invocation in this binary now flows through internal/ffmpeg.
 func (s *Server) startUploadConversion(inputPath, eventDir, infoPath string, preset ocffmpeg.QualityPreset) (int, error) {
+	// Probe up front so progress percent is correct from the first
+	// callback. Bounded with a short timeout so a hung ffprobe can't
+	// block the upload accept path. Failure is logged but not fatal.
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelProbe()
+	const ffmpegBinary = "ffmpeg"
+	duration, perr := probeDurationSecs(probeCtx, ffmpegBinary, inputPath)
+	if perr == nil {
+		updateInfoDuration(infoPath, duration)
+	} else {
+		s.logger.Info("upload duration probe failed; UI will show indeterminate bar",
+			"input", inputPath, "ffprobe", ffprobePath(ffmpegBinary), "err", perr)
+	}
+
 	cfg := ocffmpeg.Config{
-		Binary:    "ffmpeg",
+		Binary:    ffmpegBinary,
 		Mode:      ocffmpeg.ModeUpload,
 		Input:     ocffmpeg.Input{Kind: ocffmpeg.InputFile, VideoDevice: inputPath},
 		Preset:    preset,
 		Encoder:   ocffmpeg.EncoderAuto, // VideoToolbox on macOS, NVENC/QSV/VAAPI on others
-		HWAccel:   ocffmpeg.HWAccelAuto, // matched decode + encode path where possible
+		HWAccel:   ocffmpeg.HWAccelAuto, // EffectiveHWAccel forces None for ModeUpload
 		OutputDir: eventDir,
 	}
 	job, err := s.ffmpeg.StartJob(cfg, ocffmpeg.JobOptions{
 		LogPath: filepath.Join(eventDir, "ffmpeg.log"),
+		OnProgress: func(p ocffmpeg.Progress) {
+			updateInfoProgress(infoPath, p, duration)
+		},
 		OnComplete: func(err error) {
 			status := "completed"
 			if err != nil {
@@ -544,6 +597,57 @@ func uploadFilename(name string) string {
 	return name
 }
 
+// probeDurationSecs runs ffprobe to read the source's wall-clock length.
+// Returns 0 on any error (binary missing, source unparseable, timeout) —
+// callers treat 0 as "unknown" and the UI shows an indeterminate bar.
+func probeDurationSecs(ctx context.Context, ffmpegBinary, path string) (float64, error) {
+	cmd := exec.CommandContext(ctx,
+		ffprobePath(ffmpegBinary),
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		path)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return 0, fmt.Errorf("%w: %s", err, msg)
+		}
+		return 0, err
+	}
+	d, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil {
+		return 0, fmt.Errorf("unparseable duration %q: %w", strings.TrimSpace(string(out)), err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("non-positive duration %v", d)
+	}
+	return d, nil
+}
+
+// ffprobePath finds the ffprobe that ships alongside the ffmpeg binary
+// in use, so a custom or bundled ffmpeg install doesn't silently fall
+// back to whatever ffprobe (if any) is first on PATH. Falls back to
+// plain "ffprobe" when no sibling exists.
+func ffprobePath(ffmpegBinary string) string {
+	if ffmpegBinary == "" {
+		ffmpegBinary = "ffmpeg"
+	}
+	resolved, err := exec.LookPath(ffmpegBinary)
+	if err != nil {
+		return "ffprobe"
+	}
+	if real, err := filepath.EvalSymlinks(resolved); err == nil {
+		resolved = real
+	}
+	sibling := filepath.Join(filepath.Dir(resolved), "ffprobe"+filepath.Ext(resolved))
+	if fi, err := os.Stat(sibling); err == nil && !fi.IsDir() {
+		return sibling
+	}
+	return "ffprobe"
+}
+
 // updateInfoStatus rewrites info.json's status/pid fields atomically.
 // Atomic so a crash mid-write cannot leave a truncated file that
 // listEvents silently drops.
@@ -565,6 +669,92 @@ func updateInfoStatus(infoPath, status string, pid int) {
 	if status == "completed" || status == "failed" || status == "stopped" {
 		info["stopped_at"] = time.Now().Format(time.RFC3339)
 		delete(info, "pid")
+		// Once the job is done, snap progress to 100 on success so the
+		// UI doesn't show "99.7% — completed". On failure leave progress
+		// alone so the operator can see how far it got before the
+		// decoder gave up.
+		if status == "completed" {
+			if p, ok := info["progress"].(map[string]interface{}); ok {
+				p["percent"] = 100.0
+				p["updated_at"] = time.Now().Format(time.RFC3339)
+			}
+		}
+	}
+	updated, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = atomicfile.Write(infoPath, updated, 0644)
+}
+
+// updateInfoDuration writes the probed source duration into info.json.
+// Called once at upload start (before ffmpeg starts emitting progress
+// blocks) so the first progress write can compute percent correctly.
+func updateInfoDuration(infoPath string, secs float64) {
+	infoMu.Lock()
+	defer infoMu.Unlock()
+	data, err := os.ReadFile(infoPath)
+	if err != nil {
+		return
+	}
+	var info map[string]interface{}
+	if err := json.Unmarshal(data, &info); err != nil {
+		return
+	}
+	info["source_duration_secs"] = secs
+	updated, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = atomicfile.Write(infoPath, updated, 0644)
+}
+
+// updateInfoProgress writes a single ffmpeg -progress snapshot into
+// info.json. Called from the OnProgress callback — ffmpeg emits a block
+// roughly every second by default, which is also the UI's natural poll
+// cadence, so we don't throttle further. The write is atomic via
+// atomicfile.Write so a partial write can never be observed by readers.
+//
+// durationSecs is the value returned by probeDurationSecs; pass 0 when
+// the probe failed and percent will be reported as -1 (UI treats that
+// as "indeterminate").
+func updateInfoProgress(infoPath string, p ocffmpeg.Progress, durationSecs float64) {
+	// Same lock as updateInfoStatus / recordInfoPID, so a progress tick
+	// can't clobber the PID or a completion status written concurrently.
+	infoMu.Lock()
+	defer infoMu.Unlock()
+	data, err := os.ReadFile(infoPath)
+	if err != nil {
+		return
+	}
+	var info map[string]interface{}
+	if err := json.Unmarshal(data, &info); err != nil {
+		return
+	}
+	// A late tick that lands after OnComplete must not overwrite the
+	// final snapshot (completed snaps percent to 100).
+	if st, _ := info["status"].(string); st != "processing" {
+		return
+	}
+	outSecs := float64(p.OutTimeUS) / 1_000_000.0
+	percent := -1.0
+	if durationSecs > 0 {
+		percent = (outSecs / durationSecs) * 100.0
+		if percent < 0 {
+			percent = 0
+		}
+		if percent > 100 {
+			percent = 100
+		}
+	}
+	info["progress"] = map[string]interface{}{
+		"percent":       percent,
+		"frame":         p.Frame,
+		"fps":           p.FPS,
+		"speed":         p.Speed,
+		"out_time_secs": outSecs,
+		"bitrate_kbps":  p.BitrateKbps,
+		"updated_at":    p.UpdatedAt.Format(time.RFC3339),
 	}
 	updated, err := json.MarshalIndent(info, "", "  ")
 	if err != nil {

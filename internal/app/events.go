@@ -26,6 +26,45 @@ type EventInfoFile struct {
 	// FPS / QualityPreset are recorded at stream start for live events.
 	FPS           float64 `json:"fps,omitempty"`
 	QualityPreset string  `json:"quality_preset,omitempty"`
+
+	// SourceDurationSecs is the wall-clock length of the upload's source
+	// file in seconds, probed once at upload start with ffprobe. Used to
+	// compute Progress.Percent. Zero when probing failed; UI treats that
+	// as "indeterminate" and shows a non-percentage progress readout.
+	SourceDurationSecs float64 `json:"source_duration_secs,omitempty"`
+
+	// Progress is the most recent snapshot from ffmpeg's -progress
+	// stream during an upload conversion. Updated atomically by the
+	// OnProgress callback wired in startUploadConversion. Nil on a fresh
+	// upload (before the first progress block) and on non-upload events.
+	Progress *UploadProgress `json:"progress,omitempty"`
+}
+
+// UploadProgress is the per-tick snapshot exposed to the encoder UI so
+// it can render a real progress bar instead of an indeterminate spinner.
+// Mirrors internal/ffmpeg.Progress at the shape level — JSON tags are
+// snake_case to stay consistent with the rest of the on-wire schema.
+type UploadProgress struct {
+	// Percent is 0..100 based on out_time_us / SourceDurationSecs.
+	// -1 means "unknown" (SourceDurationSecs was zero — ffprobe failed
+	// or hasn't run yet). The UI should render an indeterminate bar in
+	// that case rather than a 0% one.
+	Percent float64 `json:"percent"`
+	// Frame is the number of frames encoded so far.
+	Frame int `json:"frame"`
+	// FPS is the current encode speed in frames per second.
+	FPS float64 `json:"fps"`
+	// Speed is ffmpeg's "speed=" field — e.g. "1.02x", "0.86x". Useful
+	// for spotting CPU-bound conversions vs. real-time ones at a glance.
+	Speed string `json:"speed,omitempty"`
+	// OutTimeSecs is the encoded duration so far in seconds. Pairs with
+	// SourceDurationSecs to derive Percent; exposed independently in
+	// case the UI wants to show "MM:SS / MM:SS".
+	OutTimeSecs float64 `json:"out_time_secs"`
+	// BitrateKbps is the rolling output bitrate. Mostly diagnostic.
+	BitrateKbps float64 `json:"bitrate_kbps,omitempty"`
+	// UpdatedAt is the RFC3339 timestamp of the last progress block.
+	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
 // EnsureDirs creates the per-node data directories if they don't exist.

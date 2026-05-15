@@ -811,12 +811,41 @@ select option {
 }
 .progress-bar.good { background: var(--good); }
 .progress-bar.info { background: var(--info); }
+.progress-bar.bad  { background: var(--bad); width: 100%; }
+
+/* Indeterminate: ffprobe couldn't read source duration so percent is
+   unknown. Show a moving stripe so the operator can see the upload is
+   alive rather than guessing whether it stalled. */
+.progress-bar.indeterminate {
+  width: 100%;
+  background-image: repeating-linear-gradient(
+    -45deg,
+    var(--accent) 0,
+    var(--accent) 8px,
+    var(--accent-2) 8px,
+    var(--accent-2) 16px
+  );
+  background-size: 200% 100%;
+  animation: progress-indeterminate-slide 1s linear infinite;
+}
+@keyframes progress-indeterminate-slide {
+  from { background-position: 0 0; }
+  to   { background-position: 32px 0; }
+}
+
 .progress-row {
   display: flex; justify-content: space-between;
   font-size: 12px;
   color: var(--muted);
   margin-bottom: 6px;
 }
+.progress-detail {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 6px;
+  font-variant-numeric: tabular-nums; /* numbers don't jitter as they update */
+}
+.progress-detail.bad { color: var(--bad); }
 
 .upload-zone {
   border: 1px dashed var(--line-2);

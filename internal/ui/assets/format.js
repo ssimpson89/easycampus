@@ -92,5 +92,28 @@ window.OCFormat = (() => {
     return status ? `HTTP ${status}` : "Unknown error";
   }
 
-  return { formatTime, parseTime, formatBytes, formatDate, formatBitrate, presetSummary, eventFps, errorDetail };
+
+  // formatProgressDetail renders the per-tick upload progress sub-line
+  // shown beneath the bar — e.g. "frame 5400 · 30.1 fps · 1.02x · 03:00 / 12:34".
+  // progress is the {percent, frame, fps, speed, out_time_secs, ...}
+  // block from /api/(events|cache)/upload/{id}/status; durationSecs is
+  // the sibling source_duration_secs (0 when ffprobe failed).
+  //
+  // Returns an empty string when there's nothing useful yet — the caller
+  // shows "Starting ffmpeg…" in that case.
+  function formatProgressDetail(progress, durationSecs) {
+    if (!progress) return "";
+    const parts = [];
+    if (progress.frame > 0) parts.push(`frame ${progress.frame.toLocaleString()}`);
+    if (progress.fps > 0)   parts.push(`${progress.fps.toFixed(progress.fps < 10 ? 1 : 0)} fps`);
+    if (progress.speed)     parts.push(progress.speed);
+    if (durationSecs > 0 && progress.out_time_secs >= 0) {
+      parts.push(`${formatTime(progress.out_time_secs)} / ${formatTime(durationSecs)}`);
+    } else if (progress.out_time_secs > 0) {
+      parts.push(formatTime(progress.out_time_secs));
+    }
+    return parts.join(" · ");
+  }
+
+  return { formatTime, parseTime, formatBytes, formatDate, formatBitrate, presetSummary, eventFps, errorDetail, formatProgressDetail };
 })();

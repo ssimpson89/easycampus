@@ -1313,8 +1313,13 @@ document.addEventListener("alpine:init", () => {
           return;
         }
         this.uploadStatus = "Processing video…";
-        this.uploadProgress = Math.min(data?.progress || 0, 95);
-        setTimeout(tick, 2000);
+        // progress is null until FFmpeg's first tick, then an object
+        // whose percent is -1 when the source duration is unknown.
+        const p = data?.progress;
+        if (p && typeof p === "object" && p.percent >= 0) {
+          this.uploadProgress = Math.min(p.percent, 99);
+        }
+        setTimeout(tick, 1000);
       };
       tick();
     },

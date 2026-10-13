@@ -17,6 +17,10 @@
 package ffmpeg_test
 
 import (
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -171,8 +175,9 @@ func TestConfigArgsBroadcastH264CBR(t *testing.T) {
 	if !strings.Contains(joined, "filler=1") {
 		t.Errorf("broadcast x264 missing filler=1: %s", joined)
 	}
-	// BroadcastSafe wires the limiter video filter.
-	if !strings.Contains(joined, "limiter=min=16:max=235") {
+	// BroadcastSafe wires the luma + chroma limiter filters.
+	if !strings.Contains(joined, "limiter=min=16:max=235:planes=1") ||
+		!strings.Contains(joined, "limiter=min=16:max=240:planes=6") {
 		t.Errorf("broadcast preset missing -vf limiter (broadcast-safe): %s", joined)
 	}
 	// Broadcast tier keeps B-frames; must NOT emit -bf 0.
@@ -191,6 +196,8 @@ func TestConfigArgsBroadcastH264CBR(t *testing.T) {
 // format. Tagging is load-bearing — downstream players default to
 // BT.601 on unspecified UHD.
 func TestConfigArgsBroadcast2160BT2020(t *testing.T) {
+	restore := ffmpeg.StubEncoderProbe(func(string) bool { return true })
+	defer restore()
 	preset, ok := quality.ResolveFFmpegPreset("broadcast-2160p30")
 	if !ok {
 		t.Fatal("broadcast-2160p30 missing from catalog")
@@ -215,7 +222,110 @@ func TestConfigArgsBroadcast2160BT2020(t *testing.T) {
 		"-color_primaries bt2020",
 		"-colorspace bt2020nc",
 		"-pix_fmt yuv420p10le",
+		// HEVC preset on the x264 family is promoted to libx265 Main10.
+		"-c:v libx265",
+		"-profile:v main10",
+		"-tag:v hvc1",
+		"setparams=color_primaries=bt2020:color_trc=bt709:colorspace=bt2020nc:range=tv",
+		"scale=3840:2160",
+		"limiter=min=64:max=940:planes=1",
 	)
+	if strings.Contains(joined, "-profile:v high") {
+		t.Errorf("HEVC preset must not carry an H.264 profile: %s", joined)
+	}
+}
+
+// TestConfigArgsRunAgainstRealFFmpeg executes the generated argv for a
+// short burst against the local ffmpeg and checks the stream tags with
+// ffprobe. Skipped when ffmpeg/ffprobe aren't installed or in -short.
+func TestConfigArgsRunAgainstRealFFmpeg(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode")
+	}
+	bin, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	probe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Skip("ffprobe not installed")
+	}
+	cases := []struct {
+		id        string
+		primaries string
+		pixFmt    string
+	}{
+		{"broadcast-1080p30", "bt709", "yuv420p"},
+		{"broadcast-2160p30", "bt2020", "yuv420p10le"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			preset, _ := quality.ResolveFFmpegPreset(tc.id)
+			out := t.TempDir()
+			cfg := ffmpeg.Config{
+				Binary:    bin,
+				Mode:      ffmpeg.ModeLiveHLS,
+				Input:     ffmpeg.Input{Kind: ffmpeg.InputTest},
+				Preset:    preset,
+				Encoder:   ffmpeg.EncoderX264,
+				OutputDir: out,
+			}
+			if ffmpeg.ProbeEncoder(bin, "libx265") == false && tc.pixFmt == "yuv420p10le" {
+				tc.pixFmt = "yuv420p" // 8-bit H.264 fallback path
+			}
+			args, err := cfg.Args()
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Bound the run: -frames:v before the output path.
+			args = append(args[:len(args)-1:len(args)-1], "-frames:v", "15", args[len(args)-1])
+			if b, err := exec.Command(bin, args...).CombinedOutput(); err != nil {
+				t.Fatalf("ffmpeg failed: %v\n%s\nargs: %v", err, b, args)
+			}
+			seg, _ := filepath.Glob(filepath.Join(out, "chunk-*.m4s"))
+			if len(seg) == 0 {
+				t.Fatalf("no segments written in %s", out)
+			}
+			init := filepath.Join(out, "init.mp4")
+			data, err := os.ReadFile(init)
+			if err != nil {
+				t.Fatal(err)
+			}
+			combined := filepath.Join(out, "probe.mp4")
+			seg0, _ := os.ReadFile(seg[0])
+			if err := os.WriteFile(combined, append(data, seg0...), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := exec.Command(probe, "-v", "error", "-select_streams", "v:0",
+				"-show_entries", "stream=width,height,pix_fmt,color_primaries,color_space,color_range",
+				"-of", "json", combined).Output()
+			if err != nil {
+				t.Fatalf("ffprobe: %v", err)
+			}
+			var res struct {
+				Streams []struct {
+					Width          int    `json:"width"`
+					Height         int    `json:"height"`
+					PixFmt         string `json:"pix_fmt"`
+					ColorPrimaries string `json:"color_primaries"`
+					ColorRange     string `json:"color_range"`
+				} `json:"streams"`
+			}
+			if err := json.Unmarshal(raw, &res); err != nil || len(res.Streams) == 0 {
+				t.Fatalf("ffprobe output: %s (%v)", raw, err)
+			}
+			st := res.Streams[0]
+			if st.Width != preset.Width() || st.Height != preset.Height() {
+				t.Errorf("size %dx%d, want %s", st.Width, st.Height, preset.Resolution())
+			}
+			if st.ColorPrimaries != tc.primaries || st.ColorRange != "tv" {
+				t.Errorf("tags primaries=%q range=%q, want %q/tv", st.ColorPrimaries, st.ColorRange, tc.primaries)
+			}
+			if st.PixFmt != tc.pixFmt {
+				t.Errorf("pix_fmt=%q want %q", st.PixFmt, tc.pixFmt)
+			}
+		})
+	}
 }
 
 // mustContain is a small helper that asserts every needle appears as

@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -29,10 +30,10 @@ func containsFlagPrefix(args []string, prefix string) bool {
 	return false
 }
 
-// TestRegistryHasAllSevenProfiles pins the seven required profiles
-// from the design spec. If a profile is removed or renamed, this fails
-// loudly rather than silently shipping a smaller catalog.
-func TestRegistryHasAllSevenProfiles(t *testing.T) {
+// TestRegistryListsAvailableProfiles pins the profiles All() offers.
+// decklink-broadcast is deliberately absent: upstream mpv has no
+// decklink vo / --decklink-format, so it is marked Unavailable.
+func TestRegistryListsAvailableProfiles(t *testing.T) {
 	want := []string{
 		"auto",
 		"projector-24",
@@ -40,7 +41,6 @@ func TestRegistryHasAllSevenProfiles(t *testing.T) {
 		"projector-60",
 		"tv-60",
 		"tv-50-pal",
-		"decklink-broadcast",
 	}
 	got := All()
 	if len(got) != len(want) {
@@ -50,6 +50,55 @@ func TestRegistryHasAllSevenProfiles(t *testing.T) {
 		if got[i].ID != id {
 			t.Errorf("profile[%d]: got id=%q, want %q", i, got[i].ID, id)
 		}
+		if err := got[i].CheckAvailable(); err != nil {
+			t.Errorf("All() returned unavailable profile %q: %v", id, err)
+		}
+	}
+}
+
+// TestDecklinkProfileUnavailable: still resolvable (legacy requests and
+// stored settings get a clear error), but flagged unavailable.
+func TestDecklinkProfileUnavailable(t *testing.T) {
+	p, ok := ByID("decklink-broadcast")
+	if !ok {
+		t.Fatal("decklink-broadcast should stay resolvable via ByID")
+	}
+	err := p.CheckAvailable()
+	if !errors.Is(err, ErrProfileUnavailable) || !strings.Contains(err.Error(), "decklink") {
+		t.Fatalf("CheckAvailable() = %v, want ErrProfileUnavailable mentioning decklink", err)
+	}
+	if _, err := ByIDAvailable("decklink-broadcast"); !errors.Is(err, ErrProfileUnavailable) {
+		t.Errorf("ByIDAvailable(decklink-broadcast) err=%v", err)
+	}
+	if _, err := ByIDAvailable("projector-30"); err != nil {
+		t.Errorf("ByIDAvailable(projector-30) err=%v", err)
+	}
+	if _, err := ByIDAvailable("nope"); err == nil {
+		t.Error("ByIDAvailable(unknown) should error")
+	}
+}
+
+// TestDescriptionsCarryCorrectCadenceArithmetic guards against the old
+// wrong figures ("1-2-1-2-1-3", "clean 2.5x" 24→60) creeping back in.
+func TestDescriptionsCarryCorrectCadenceArithmetic(t *testing.T) {
+	for _, p := range All() {
+		for _, bad := range []string{"1-2-1-2-1-3", "2.5×", "without judder"} {
+			if strings.Contains(p.Description, bad) {
+				t.Errorf("profile %q description contains stale cadence claim %q", p.ID, bad)
+			}
+		}
+	}
+	p30, _ := ByID("projector-30")
+	if !strings.Contains(p30.Description, "2-1-1-1") {
+		t.Errorf("projector-30 should describe the 2-1-1-1 pattern: %q", p30.Description)
+	}
+	p60, _ := ByID("projector-60")
+	if !strings.Contains(p60.Description, "3:2 pulldown") {
+		t.Errorf("projector-60 should describe 3:2 pulldown: %q", p60.Description)
+	}
+	pal, _ := ByID("tv-50-pal")
+	if !strings.Contains(pal.Description, "2-2-1") {
+		t.Errorf("tv-50-pal should describe the 30→50 2-2-1 pattern: %q", pal.Description)
 	}
 }
 

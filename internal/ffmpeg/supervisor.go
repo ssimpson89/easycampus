@@ -38,8 +38,13 @@ type Status struct {
 	LastError    string    `json:"lastError,omitempty"`
 	LastLogLine  string    `json:"lastLogLine,omitempty"`
 	LastProgress Progress  `json:"lastProgress"`
-	PresetID     string    `json:"presetId,omitempty"`
-	PID          int       `json:"pid,omitempty"`
+	// LastAdvanceAt is when Frame or OutTimeUS last moved forward. The
+	// stall watchdog keys off this, not LastProgress.UpdatedAt: FFmpeg
+	// keeps emitting progress=continue blocks with a frozen frame count
+	// when the capture device wedges.
+	LastAdvanceAt time.Time `json:"lastAdvanceAt,omitempty"`
+	PresetID      string    `json:"presetId,omitempty"`
+	PID           int       `json:"pid,omitempty"`
 }
 
 // SupervisorConfig controls restart backoff + stall detection.
@@ -48,7 +53,7 @@ type SupervisorConfig struct {
 	RestartMaxDelay     time.Duration
 	StableAfter         time.Duration // process must run this long to reset the backoff
 	ProgressStallAfter  time.Duration // no -progress for this long => declare stalled
-	MaxRestarts         int           // hard cap
+	MaxRestarts         int           // crash-restart budget; reset after StableAfter of healthy running
 	PidFilePath         string        // empty disables pid-file reaping
 }
 
@@ -67,12 +72,22 @@ type Supervisor struct {
 	status  Status
 	pidFile *PidFile
 	restart chan string
+	// generation increments on every Start so SwapPreset can refuse to
+	// act on a stream that was stopped (or replaced) in the meantime.
+	generation uint64
 
 	onRestart     func()
 	onStateChange func()
 }
 
-var errRestartRequested = errors.New("supervisor restart requested")
+var (
+	errRestartRequested = errors.New("supervisor restart requested")
+	errProgressStalled  = errors.New("ffmpeg progress stalled")
+
+	// ErrNotRunning is returned by SwapPreset when there is no active
+	// stream (or the stream it targeted has since been stopped).
+	ErrNotRunning = errors.New("stream is not running")
+)
 
 // NewSupervisor builds a supervisor with sensible defaults applied to any
 // zero fields in cfg.
@@ -175,6 +190,7 @@ func (s *Supervisor) Start(config Config, eventID string) error {
 	s.restart = make(chan string, 1)
 	s.config = config
 	s.eventID = eventID
+	s.generation++
 	s.status = Status{
 		State:     StateStarting,
 		EventID:   eventID,
@@ -191,12 +207,22 @@ func (s *Supervisor) Start(config Config, eventID string) error {
 
 // Restart asks the running supervisor loop to bounce FFmpeg while keeping
 // the stream intent active. Returns false when no active stream.
+//
+// Requested restarts don't count against MaxRestarts and skip backoff.
+// On live HLS the next run appends to the existing playlist.
 func (s *Supervisor) Restart(reason string) bool {
 	s.mu.Lock()
 	if s.cancel == nil || s.restart == nil {
 		s.mu.Unlock()
 		return false
 	}
+	s.requestRestartLocked(reason)
+	s.mu.Unlock()
+	s.emitStateChange()
+	return true
+}
+
+func (s *Supervisor) requestRestartLocked(reason string) {
 	if reason == "" {
 		reason = "restart requested"
 	}
@@ -207,9 +233,61 @@ func (s *Supervisor) Restart(reason string) bool {
 	case s.restart <- reason:
 	default:
 	}
+}
+
+// Generation identifies the current stream: it increments on every
+// Start. Pair with SwapPresetIfGeneration to make sure a decision made
+// against one stream isn't applied to a later one.
+func (s *Supervisor) Generation() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.generation
+}
+
+// SwapPreset atomically replaces the running stream's preset and
+// restarts FFmpeg with it, keeping the event ID and (on live HLS)
+// appending to the existing playlist. Returns ErrNotRunning when no
+// stream is active; it never starts a stopped stream.
+func (s *Supervisor) SwapPreset(p QualityPreset, reason string) error {
+	return s.SwapPresetIfGeneration(p, reason, 0)
+}
+
+// SwapPresetIfGeneration is SwapPreset guarded by a generation check:
+// when gen != 0 and the supervisor has been restarted via Start since
+// gen was read, it returns ErrNotRunning and changes nothing.
+func (s *Supervisor) SwapPresetIfGeneration(p QualityPreset, reason string, gen uint64) error {
+	if p == nil {
+		return errors.New("preset is required")
+	}
+	s.mu.Lock()
+	if s.cancel == nil || (gen != 0 && s.generation != gen) {
+		s.mu.Unlock()
+		return ErrNotRunning
+	}
+	gen = s.generation
+	cfg := s.config
+	s.mu.Unlock()
+
+	// Validate outside the lock: Args() may probe encoders.
+	cfg.Preset = p
+	if _, err := cfg.Args(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	if s.cancel == nil || s.restart == nil || s.generation != gen {
+		s.mu.Unlock()
+		return ErrNotRunning
+	}
+	s.config.Preset = p
+	s.status.PresetID = p.ID()
+	if reason == "" {
+		reason = "quality preset changed to " + p.ID()
+	}
+	s.requestRestartLocked(reason)
 	s.mu.Unlock()
 	s.emitStateChange()
-	return true
+	return nil
 }
 
 // Stop signals the supervised FFmpeg to exit gracefully and waits for the
@@ -252,12 +330,15 @@ func (s *Supervisor) Status() Status {
 	return status
 }
 
+// progressStalled reports whether frame / out_time has failed to
+// advance for longer than `after`. Before the first advance it measures
+// from StartedAt (the run start).
 func (s Status) progressStalled(after time.Duration, now time.Time) bool {
 	if after <= 0 {
 		return false
 	}
-	if !s.LastProgress.UpdatedAt.IsZero() {
-		return now.Sub(s.LastProgress.UpdatedAt) > after
+	if !s.LastAdvanceAt.IsZero() {
+		return now.Sub(s.LastAdvanceAt) > after
 	}
 	return !s.StartedAt.IsZero() && now.Sub(s.StartedAt) > after
 }
@@ -271,10 +352,11 @@ func (s *Supervisor) progressStalledSince(started time.Time) (bool, string) {
 	if !status.progressStalled(after, now) {
 		return false, ""
 	}
-	if status.LastProgress.UpdatedAt.IsZero() {
-		return true, fmt.Sprintf("FFmpeg reported no progress for %s", now.Sub(started).Round(time.Second))
+	if status.LastAdvanceAt.IsZero() {
+		return true, fmt.Sprintf("FFmpeg produced no frames for %s", now.Sub(started).Round(time.Second))
 	}
-	return true, fmt.Sprintf("FFmpeg progress stalled for %s", now.Sub(status.LastProgress.UpdatedAt).Round(time.Second))
+	return true, fmt.Sprintf("FFmpeg output frozen for %s (frame %d)",
+		now.Sub(status.LastAdvanceAt).Round(time.Second), status.LastProgress.Frame)
 }
 
 func (s *Supervisor) markDegraded(reason string) {
@@ -312,34 +394,55 @@ func (s *Supervisor) run(ctx context.Context) {
 		}
 	}()
 
-	restarts := 0
+	crashes := 0       // crash/stall restarts since the last stable run
+	totalRestarts := 0 // every restart, surfaced in Status.RestartCount
 	quickFailures := 0 // back-to-back failures inside quickFailWindow
 	const quickFailWindow = 5 * time.Second
 	const quickFailLimit = 2
 	delay := s.cfg.RestartInitialDelay
-	for {
+	for run := 0; ; run++ {
 		started := time.Now()
-		err := s.runOnce(ctx)
+		err := s.runOnce(ctx, run)
 
 		if ctx.Err() != nil {
 			s.setExit(StateStopping, "stopped by user", "")
 			return
 		}
 
-		restarts++
 		elapsed := time.Since(started)
 		lastExit := exitMessage(err)
+		requested := errors.Is(err, errRestartRequested)
+		totalRestarts++
+
+		// A run that stayed up for StableAfter resets the crash budget
+		// and the backoff; MaxRestarts bounds crash *storms*, not the
+		// lifetime of a service-length stream.
+		if elapsed >= s.cfg.StableAfter {
+			crashes = 0
+			quickFailures = 0
+			delay = s.cfg.RestartInitialDelay
+		}
+
+		s.mu.Lock()
+		s.status.RestartCount = totalRestarts
+		s.status.LastExit = lastExit
+		s.status.UpdatedAt = time.Now().UTC()
+		onRestart := s.onRestart
+		s.mu.Unlock()
+
+		if requested {
+			// Operator / adaptive-controller restart: not a failure.
+			// No budget, no backoff, no onRestart (it feeds the
+			// adaptive controller's instability detector).
+			continue
+		}
+
+		crashes++
 		if elapsed < quickFailWindow {
 			quickFailures++
 		} else {
 			quickFailures = 0
 		}
-		s.mu.Lock()
-		s.status.RestartCount = restarts
-		s.status.LastExit = lastExit
-		s.status.UpdatedAt = time.Now().UTC()
-		onRestart := s.onRestart
-		s.mu.Unlock()
 		if onRestart != nil {
 			onRestart()
 		}
@@ -349,12 +452,9 @@ func (s *Supervisor) run(ctx context.Context) {
 				"FFmpeg failed to start twice in a row. Check the capture device and output directory permissions.")
 			return
 		}
-		if restarts > s.cfg.MaxRestarts {
+		if crashes > s.cfg.MaxRestarts {
 			s.setExit(StateFailed, lastExit, "FFmpeg crashed too many times")
 			return
-		}
-		if elapsed >= s.cfg.StableAfter {
-			delay = s.cfg.RestartInitialDelay
 		}
 		wait := withJitter(delay)
 		s.setRestarting(lastExit, wait)
@@ -369,13 +469,30 @@ func (s *Supervisor) run(ctx context.Context) {
 	}
 }
 
-func (s *Supervisor) runOnce(ctx context.Context) error {
-	args, err := s.config.Args()
+// runOnce runs one FFmpeg process. `run` is 0 for the first run of a
+// stream; later runs on live HLS append to the existing playlist and use
+// a fresh fMP4 init filename.
+func (s *Supervisor) runOnce(ctx context.Context, run int) error {
+	s.mu.Lock()
+	// A restart requested while we were in backoff is satisfied by this
+	// run (it reads the latest config below); drop it so the new process
+	// isn't bounced immediately.
+	select {
+	case <-s.restart:
+	default:
+	}
+	cfg := s.config
+	s.mu.Unlock()
+	if run > 0 && cfg.Mode == ModeLiveHLS {
+		cfg.HLSAppend = true
+		cfg.HLSInitFile = RunInitFilename(cfg.HLSInitFile, run)
+	}
+	args, err := cfg.Args()
 	if err != nil {
 		return err
 	}
 
-	cmd := exec.Command(s.config.Binary, args...)
+	cmd := exec.Command(cfg.Binary, args...)
 	setSysProcAttr(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -402,17 +519,21 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	s.status.State = StateRunning
 	s.status.StartedAt = time.Now().UTC()
 	s.status.LastProgress = Progress{}
+	s.status.LastAdvanceAt = time.Time{}
 	s.status.LastError = ""
 	s.status.PID = cmd.Process.Pid
 	s.status.UpdatedAt = time.Now().UTC()
-	streamKey := s.config.StreamKey
 	preset := s.status.PresetID
-	mode := s.config.Mode
 	s.mu.Unlock()
 
 	s.emitStateChange()
-	s.logger.Printf("stream-start: mode=%s preset=%s pid=%d", mode, preset, cmd.Process.Pid)
+	s.logger.Printf("stream-start: mode=%s preset=%s codec=%s run=%d pid=%d",
+		cfg.Mode, preset, cfg.EffectiveVideoCodec(), run, cmd.Process.Pid)
 
+	// Readers must drain to EOF before cmd.Wait (Wait closes the pipes
+	// and would drop FFmpeg's final stderr lines — usually the error).
+	// So Wait runs only after both readers finish; kill/terminate is
+	// driven from the select below.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -421,24 +542,30 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	}()
 	go func() {
 		defer wg.Done()
-		s.recordLogs(stderr, streamKey)
+		s.recordLogs(stderr, cfg.StreamKey)
+	}()
+	waitCh := make(chan error, 1)
+	go func() {
+		wg.Wait()
+		waitCh <- cmd.Wait()
 	}()
 
-	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
 	stallTicker := time.NewTicker(time.Second)
 	defer stallTicker.Stop()
 	s.mu.Lock()
 	restartCh := s.restart
 	s.mu.Unlock()
 
+	finish := func() {
+		if s.pidFile != nil {
+			s.pidFile.Clear()
+		}
+	}
+
 	for {
 		select {
 		case err := <-waitCh:
-			wg.Wait()
-			if s.pidFile != nil {
-				s.pidFile.Clear()
-			}
+			finish()
 			s.logger.Printf("stream-end: ffmpeg exited after %s (%s)",
 				time.Since(processStarted).Round(time.Second), exitMessage(err))
 			return err
@@ -449,10 +576,7 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 			}
 			s.logger.Printf("supervisor: restarting FFmpeg: %s", reason)
 			err := terminateCommand(cmd, waitCh, 5*time.Second)
-			wg.Wait()
-			if s.pidFile != nil {
-				s.pidFile.Clear()
-			}
+			finish()
 			if err != nil {
 				return fmt.Errorf("%w: %s (%v)", errRestartRequested, reason, err)
 			}
@@ -463,23 +587,17 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 				s.logger.Printf("supervisor: restarting FFmpeg: %s", reason)
 				s.markDegraded(reason)
 				err := terminateCommand(cmd, waitCh, 5*time.Second)
-				wg.Wait()
-				if s.pidFile != nil {
-					s.pidFile.Clear()
-				}
+				finish()
 				if err != nil {
-					return fmt.Errorf("%w: %s (%v)", errRestartRequested, reason, err)
+					return fmt.Errorf("%w: %s (%v)", errProgressStalled, reason, err)
 				}
-				return fmt.Errorf("%w: %s", errRestartRequested, reason)
+				return fmt.Errorf("%w: %s", errProgressStalled, reason)
 			}
 
 		case <-ctx.Done():
 			s.logger.Printf("supervisor: stopping FFmpeg (pid %d)", cmd.Process.Pid)
 			err := terminateCommand(cmd, waitCh, 5*time.Second)
-			wg.Wait()
-			if s.pidFile != nil {
-				s.pidFile.Clear()
-			}
+			finish()
 			return err
 		}
 	}
@@ -487,9 +605,19 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 
 func (s *Supervisor) recordProgress(progress Progress) {
 	s.mu.Lock()
+	prev := s.status.LastProgress
+	advanced := progress.Frame > prev.Frame || progress.OutTimeUS > prev.OutTimeUS
 	s.status.LastProgress = progress
 	s.status.UpdatedAt = time.Now().UTC()
-	recovered := s.status.State == StateDegraded
+	if advanced {
+		s.status.LastAdvanceAt = progress.UpdatedAt
+		if s.status.LastAdvanceAt.IsZero() {
+			s.status.LastAdvanceAt = time.Now().UTC()
+		}
+	}
+	// Only real forward progress clears a degraded state; a frozen
+	// frame counter must not flip the stream back to "running".
+	recovered := advanced && s.status.State == StateDegraded
 	if recovered {
 		s.status.State = StateRunning
 		s.status.LastError = ""

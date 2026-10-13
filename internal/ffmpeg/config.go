@@ -4,87 +4,73 @@
 // Config + Supervisor.
 //
 // Design notes:
-//   - Live encode (capture device -> HLS) is built by BuildLiveArgs.
-//     Stall watchdog + restart-with-backoff is handled by Supervisor.
-//   - Upload conversion (input file -> HLS) is built by BuildUploadArgs.
-//     Runs once to completion; no restart loop.
-//   - External / network source (RTSP/SRT/HLS pull -> HLS) is built by
-//     BuildExternalArgs. Long-running with reconnect flags but no stall
-//     watchdog (upstream pacing isn't ours to control).
+//   - Live encode (capture device -> HLS) is built by Config.Args with
+//     Mode = ModeLiveHLS. Stall watchdog + restart-with-backoff is
+//     handled by Supervisor; restarts append to the existing playlist.
+//   - Upload conversion (input file / URL -> HLS) is Mode = ModeUpload.
+//     Runs once to completion (Job); no restart loop.
 //
-// The QualityPreset interface (see below) is the seam left open for the
-// broadcast engineer who is populating the consumer/prosumer/broadcast/
-// cinema quality matrix in parallel. Don't add tier-specific knowledge
-// to this file — add it to a QualityPreset implementation and pass it in.
+// The QualityPreset interface (see below) is the seam for the
+// consumer/prosumer/broadcast/cinema quality matrix in internal/quality.
+// Don't add tier-specific knowledge to this file — add it to a
+// QualityPreset implementation (or an optional capability interface)
+// and pass it in.
 package ffmpeg
 
 import (
-	"context"
 	"fmt"
-	"net/url"
-	"os/exec"
-	"regexp"
+	"log"
 	"runtime"
 	"strings"
-	"time"
+	"sync"
 )
 
 // -----------------------------------------------------------------------------
 // QualityPreset — broadcast-engineer integration surface.
 // -----------------------------------------------------------------------------
 //
-// The parallel "broadcast engineer" agent owns the tier table (consumer,
-// prosumer, broadcast, cinema). They populate concrete QualityPreset
-// implementations that the live-encode and upload-conversion code paths
-// pick up via dependency injection — Config.Preset is a QualityPreset.
-//
 // Contract:
 //
 //   - All methods must be safe to call from any goroutine. Implementations
 //     should be value types or guarded by their own locks.
 //   - Bitrate strings use FFmpeg's k/M suffix convention ("6M", "8000k").
-//   - Resolution() returns "WxH" (e.g. "1920x1080") as accepted by `-s`
-//     and the `scale=` filter.
+//   - Resolution() returns "WxH" (e.g. "1920x1080"). Width()/Height()
+//     drive the `scale=W:H` filter and the capture-size request.
 //   - FPSExpr() returns "30", "60", "24000/1001" — passed verbatim to
 //     `-r`. Cinema presets MUST return the rational form so 23.976 does
 //     not drift to 24.000 over service-length streams.
 //   - GOP() returns the frame-count interval between keyframes. For
 //     standard live HLS this is FPS() * 2 (two-second segments).
-//   - PixelFormat() returns "yuv420p" for SDR HLS (the safe choice that
-//     plays everywhere); broadcast / cinema tiers may return "yuv422p10le"
-//     or similar for archival uses.
-//   - Profile() / Level() are the H.264 profile and level strings
-//     ("high" / "4.1"). Hardware encoders translate these per backend.
-//   - VideoEncoderPreset() returns the speed preset name. For libx264 this
-//     is "ultrafast".."veryslow". For NVENC it's "p1".."p7". For Apple
-//     VideoToolbox it's ignored (VT has no preset). The empty string
-//     means "use the encoder's default".
+//   - PixelFormat() returns "yuv420p" for SDR HLS; HEVC tiers may return
+//     "yuv420p10le". The args builder maps it to the encoder's native
+//     layout (p010le on VideoToolbox / NVENC).
+//   - Profile() / Level() are profile and level strings ("high" / "4.1").
+//     An HEVC "main10" profile is mapped to "high" if the encode falls
+//     back to H.264.
+//   - VideoEncoderPreset() returns an x264-style speed preset name
+//     ("ultrafast".."veryslow"). It is translated per backend (NVENC
+//     p1..p7, QSV veryfast..veryslow, ignored on VideoToolbox / VAAPI).
+//     NVENC "p1".."p7" are passed through unchanged. Empty means "use
+//     our per-encoder default".
 //   - Tune() returns "zerolatency", "film", "animation", "", etc. Empty
 //     means "do not pass -tune". The live encode path force-overrides
-//     this to "zerolatency" when WantsZeroLatency() reports true to
-//     guarantee low-latency live behavior regardless of tier choice.
+//     this to "zerolatency" when WantsZeroLatency() reports true.
 //   - WantsBFrames() lets cinema/archive tiers opt INTO B-frames where
-//     consumer/broadcast live tiers turn them off. The encoder-args
-//     builder reads this to decide -bf 0 vs leaving the encoder default.
-//
-// QualityPreset is intentionally narrow. If something doesn't fit
-// (HDR mastering display metadata, AV1 toggles, etc.) the parallel
-// engineer can extend with a typed extension interface — do NOT widen
-// this interface without an audit of every consumer.
+//     consumer live tiers turn them off (-bf 0).
 type QualityPreset interface {
-	ID() string             // stable identifier ("consumer-1080p30", "broadcast-2160p60", ...)
-	Label() string          // human-friendly name shown in UI
-	Resolution() string     // "1920x1080"
-	Width() int             // numeric pieces of Resolution
-	Height() int            //
-	FPS() int               // integer FPS rounded down (30, 60). Use FPSExpr for the wire value.
-	FPSExpr() string        // "30" | "60" | "24000/1001"
-	GOP() int               // keyframe interval in frames
-	VideoBitrate() string   // "6M" / "8000k"
-	AudioBitrate() string   // "128k" / "192k"
-	PixelFormat() string    // "yuv420p"
-	Profile() string        // "high"
-	Level() string          // "4.1"
+	ID() string           // stable identifier ("consumer-1080p30", "broadcast-2160p60", ...)
+	Label() string        // human-friendly name shown in UI
+	Resolution() string   // "1920x1080"
+	Width() int           // numeric pieces of Resolution
+	Height() int          //
+	FPS() int             // integer FPS rounded down (30, 60). Use FPSExpr for the wire value.
+	FPSExpr() string      // "30" | "60" | "24000/1001"
+	GOP() int             // keyframe interval in frames
+	VideoBitrate() string // "6M" / "8000k"
+	AudioBitrate() string // "128k" / "192k"
+	PixelFormat() string  // "yuv420p"
+	Profile() string      // "high"
+	Level() string        // "4.1"
 	VideoEncoderPreset() string
 	Tune() string           // "" or "zerolatency" etc.
 	WantsZeroLatency() bool // forces -tune zerolatency on the live path
@@ -92,38 +78,30 @@ type QualityPreset interface {
 }
 
 // DefaultPreset is a minimal, conservative QualityPreset used when the
-// broadcast engineer's tier matrix is absent (early commits, tests,
-// degraded operation). It targets 1080p30 at 6 Mbps — the existing
-// easycampus-go "high" quality setting.
-//
-// The broadcast engineer's table will replace this with proper
-// consumer/prosumer/broadcast/cinema tiers, but having a non-nil
-// preset here means the rest of the codebase doesn't need nil checks
-// and uploads keep working through the transition.
+// tier matrix is absent (tests, degraded operation). It targets 1080p30
+// at 6 Mbps — the existing easycampus-go "high" quality setting.
 type DefaultPreset struct{}
 
-func (DefaultPreset) ID() string                { return "default-1080p30" }
-func (DefaultPreset) Label() string             { return "1080p30 @ 6 Mbps" }
-func (DefaultPreset) Resolution() string        { return "1920x1080" }
-func (DefaultPreset) Width() int                { return 1920 }
-func (DefaultPreset) Height() int               { return 1080 }
-func (DefaultPreset) FPS() int                  { return 30 }
-func (DefaultPreset) FPSExpr() string           { return "30" }
-func (DefaultPreset) GOP() int                  { return 60 }
-func (DefaultPreset) VideoBitrate() string      { return "6000k" }
-func (DefaultPreset) AudioBitrate() string      { return "128k" }
-func (DefaultPreset) PixelFormat() string       { return "yuv420p" }
-func (DefaultPreset) Profile() string           { return "high" }
-func (DefaultPreset) Level() string             { return "4.1" }
+func (DefaultPreset) ID() string                 { return "default-1080p30" }
+func (DefaultPreset) Label() string              { return "1080p30 @ 6 Mbps" }
+func (DefaultPreset) Resolution() string         { return "1920x1080" }
+func (DefaultPreset) Width() int                 { return 1920 }
+func (DefaultPreset) Height() int                { return 1080 }
+func (DefaultPreset) FPS() int                   { return 30 }
+func (DefaultPreset) FPSExpr() string            { return "30" }
+func (DefaultPreset) GOP() int                   { return 60 }
+func (DefaultPreset) VideoBitrate() string       { return "6000k" }
+func (DefaultPreset) AudioBitrate() string       { return "128k" }
+func (DefaultPreset) PixelFormat() string        { return "yuv420p" }
+func (DefaultPreset) Profile() string            { return "high" }
+func (DefaultPreset) Level() string              { return "4.1" }
 func (DefaultPreset) VideoEncoderPreset() string { return "veryfast" }
-func (DefaultPreset) Tune() string              { return "" }
-func (DefaultPreset) WantsZeroLatency() bool    { return true }
-func (DefaultPreset) WantsBFrames() bool        { return false }
+func (DefaultPreset) Tune() string               { return "" }
+func (DefaultPreset) WantsZeroLatency() bool     { return true }
+func (DefaultPreset) WantsBFrames() bool         { return false }
 
-// SimplePreset is a flexible QualityPreset implementation for the existing
+// SimplePreset is a flexible QualityPreset implementation for the
 // "low" / "standard" / "high" / "ultra" buckets used by upload conversion.
-// Lets handlers_upload migrate before the broadcast engineer's tier table
-// lands without diverging the upload code path.
 type SimplePreset struct {
 	IDValue            string
 	LabelValue         string
@@ -141,221 +119,33 @@ type SimplePreset struct {
 	BFrames            bool
 }
 
-func (p SimplePreset) ID() string                { return p.IDValue }
-func (p SimplePreset) Label() string             { return p.LabelValue }
-func (p SimplePreset) Resolution() string        { return fmt.Sprintf("%dx%d", p.W, p.H) }
-func (p SimplePreset) Width() int                { return p.W }
-func (p SimplePreset) Height() int               { return p.H }
-func (p SimplePreset) FPS() int                  { return p.FPSInt }
+func (p SimplePreset) ID() string         { return p.IDValue }
+func (p SimplePreset) Label() string      { return p.LabelValue }
+func (p SimplePreset) Resolution() string { return fmt.Sprintf("%dx%d", p.W, p.H) }
+func (p SimplePreset) Width() int         { return p.W }
+func (p SimplePreset) Height() int        { return p.H }
+func (p SimplePreset) FPS() int           { return p.FPSInt }
 func (p SimplePreset) FPSExpr() string {
 	if p.FPSString != "" {
 		return p.FPSString
 	}
 	return fmt.Sprintf("%d", p.FPSInt)
 }
-func (p SimplePreset) GOP() int                  { return p.GOPFrames }
-func (p SimplePreset) VideoBitrate() string      { return p.VBitrate }
-func (p SimplePreset) AudioBitrate() string      { return p.ABitrate }
+func (p SimplePreset) GOP() int             { return p.GOPFrames }
+func (p SimplePreset) VideoBitrate() string { return p.VBitrate }
+func (p SimplePreset) AudioBitrate() string { return p.ABitrate }
 func (p SimplePreset) PixelFormat() string {
 	if p.PixFmt == "" {
 		return "yuv420p"
 	}
 	return p.PixFmt
 }
-func (p SimplePreset) Profile() string           { return p.ProfileValue }
-func (p SimplePreset) Level() string             { return p.LevelValue }
+func (p SimplePreset) Profile() string            { return p.ProfileValue }
+func (p SimplePreset) Level() string              { return p.LevelValue }
 func (p SimplePreset) VideoEncoderPreset() string { return p.EncoderPreset }
-func (p SimplePreset) Tune() string              { return p.TuneValue }
-func (p SimplePreset) WantsZeroLatency() bool    { return p.ZeroLatency }
-func (p SimplePreset) WantsBFrames() bool        { return p.BFrames }
-
-// -----------------------------------------------------------------------------
-// Encoder + hwaccel detection
-// -----------------------------------------------------------------------------
-
-// Encoder selects which H.264 video encoder FFmpeg uses.
-type Encoder string
-
-const (
-	EncoderAuto         Encoder = ""                  // pick the best available
-	EncoderX264         Encoder = "libx264"           // Software (CPU)
-	EncoderVideoToolbox Encoder = "h264_videotoolbox" // macOS hardware
-	EncoderNVENC        Encoder = "h264_nvenc"        // NVIDIA GPU
-	EncoderVAAPI        Encoder = "h264_vaapi"        // Linux Intel/AMD GPU
-	EncoderQSV          Encoder = "h264_qsv"          // Intel QuickSync
-)
-
-// HWAccel is the hardware-accelerated decode path FFmpeg uses on inputs.
-// Distinct from the encoder choice — a v4l2 input can decode via vaapi
-// while encoding with libx264, and an HLS pull can decode via
-// videotoolbox while encoding with anything.
-type HWAccel string
-
-const (
-	HWAccelNone         HWAccel = ""
-	HWAccelAuto         HWAccel = "auto"
-	HWAccelVideoToolbox HWAccel = "videotoolbox"
-	HWAccelCUDA         HWAccel = "cuda"
-	HWAccelVAAPI        HWAccel = "vaapi"
-	HWAccelQSV          HWAccel = "qsv"
-	HWAccelD3D11        HWAccel = "d3d11va"
-	HWAccelDXVA2        HWAccel = "dxva2"
-)
-
-// EncoderInfo describes a detected encoder for UI consumption.
-type EncoderInfo struct {
-	ID          Encoder `json:"id"`
-	Name        string  `json:"name"`
-	Description string  `json:"description"`
-	Available   bool    `json:"available"`
-}
-
-// knownEncoders lists all encoders we know how to configure, in display order.
-var knownEncoders = []EncoderInfo{
-	{EncoderX264, "Software (x264)", "CPU-based, widest compatibility. Always available.", true},
-	{EncoderVideoToolbox, "Apple VideoToolbox", "macOS hardware encoder.", false},
-	{EncoderNVENC, "NVIDIA NVENC", "NVIDIA GPU hardware encoder.", false},
-	{EncoderVAAPI, "VA-API", "Linux Intel/AMD GPU hardware encoder.", false},
-	{EncoderQSV, "Intel QuickSync", "Intel GPU hardware encoder.", false},
-}
-
-// DetectEncoders probes ffmpeg for available H.264 encoders.
-func DetectEncoders(binary string) []EncoderInfo {
-	if binary == "" {
-		binary = "ffmpeg"
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, binary, "-hide_banner", "-encoders").CombinedOutput()
-	if err != nil {
-		result := make([]EncoderInfo, len(knownEncoders))
-		copy(result, knownEncoders)
-		return result
-	}
-	output := string(out)
-	result := make([]EncoderInfo, len(knownEncoders))
-	copy(result, knownEncoders)
-	for i := range result {
-		if result[i].ID == EncoderX264 {
-			result[i].Available = true
-			continue
-		}
-		if strings.Contains(output, string(result[i].ID)) {
-			result[i].Available = true
-		}
-	}
-	return result
-}
-
-// DetectHWAccels probes `ffmpeg -hwaccels` for usable input acceleration.
-func DetectHWAccels(binary string) []HWAccel {
-	if binary == "" {
-		binary = "ffmpeg"
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, binary, "-hide_banner", "-hwaccels").CombinedOutput()
-	if err != nil {
-		return nil
-	}
-	var avail []HWAccel
-	for _, line := range strings.Split(string(out), "\n") {
-		trimmed := strings.TrimSpace(line)
-		switch trimmed {
-		case "videotoolbox":
-			avail = append(avail, HWAccelVideoToolbox)
-		case "cuda":
-			avail = append(avail, HWAccelCUDA)
-		case "vaapi":
-			avail = append(avail, HWAccelVAAPI)
-		case "qsv":
-			avail = append(avail, HWAccelQSV)
-		case "d3d11va":
-			avail = append(avail, HWAccelD3D11)
-		case "dxva2":
-			avail = append(avail, HWAccelDXVA2)
-		}
-	}
-	return avail
-}
-
-// PickEncoder returns the best available encoder for the current platform.
-// Order of preference:
-//
-//	macOS: VideoToolbox -> libx264
-//	Linux: NVENC -> QSV -> VAAPI -> libx264
-//	Windows: NVENC -> QSV -> libx264
-//
-// We never return Auto — callers get a concrete encoder they can pass to
-// `-c:v` without further branching.
-func PickEncoder(available []EncoderInfo) Encoder {
-	has := map[Encoder]bool{}
-	for _, e := range available {
-		if e.Available {
-			has[e.ID] = true
-		}
-	}
-	switch runtime.GOOS {
-	case "darwin":
-		if has[EncoderVideoToolbox] {
-			return EncoderVideoToolbox
-		}
-	case "linux":
-		if has[EncoderNVENC] {
-			return EncoderNVENC
-		}
-		if has[EncoderQSV] {
-			return EncoderQSV
-		}
-		if has[EncoderVAAPI] {
-			return EncoderVAAPI
-		}
-	case "windows":
-		if has[EncoderNVENC] {
-			return EncoderNVENC
-		}
-		if has[EncoderQSV] {
-			return EncoderQSV
-		}
-	}
-	return EncoderX264
-}
-
-// PickHWAccel chooses the best input-decode hardware accelerator that
-// matches the chosen encoder (using the same HW pipeline for decode +
-// encode is materially faster than crossing hwaccels). Returns
-// HWAccelNone when nothing is available; callers omit -hwaccel entirely
-// in that case.
-func PickHWAccel(available []HWAccel, encoder Encoder) HWAccel {
-	has := map[HWAccel]bool{}
-	for _, a := range available {
-		has[a] = true
-	}
-	switch encoder {
-	case EncoderVideoToolbox:
-		if has[HWAccelVideoToolbox] {
-			return HWAccelVideoToolbox
-		}
-	case EncoderNVENC:
-		if has[HWAccelCUDA] {
-			return HWAccelCUDA
-		}
-	case EncoderVAAPI:
-		if has[HWAccelVAAPI] {
-			return HWAccelVAAPI
-		}
-	case EncoderQSV:
-		if has[HWAccelQSV] {
-			return HWAccelQSV
-		}
-	}
-	// Mismatched encoder/hwaccel: fall back to auto if anything is
-	// available so the input decode still gets accelerated.
-	if len(available) > 0 {
-		return HWAccelAuto
-	}
-	return HWAccelNone
-}
+func (p SimplePreset) Tune() string               { return p.TuneValue }
+func (p SimplePreset) WantsZeroLatency() bool     { return p.ZeroLatency }
+func (p SimplePreset) WantsBFrames() bool         { return p.BFrames }
 
 // -----------------------------------------------------------------------------
 // Inputs
@@ -377,12 +167,26 @@ const (
 
 // Input describes the source side of an FFmpeg invocation.
 type Input struct {
-	Kind        InputKind
-	VideoDevice string // device path / index / URL / file path
-	AudioDevice string // optional secondary audio source (avfoundation only)
+	Kind InputKind
+	// VideoDevice is the device path / index / name / file path. For
+	// dshow it is the device name; a "video=" prefix is added if missing.
+	VideoDevice string
+	// AudioDevice is an optional secondary audio source: the
+	// avfoundation audio index, or the dshow audio device name (emitted
+	// as ":audio=<name>").
+	AudioDevice string
 	URL         string // when Kind == InputNetwork
-	Framerate   int    // device framerate hint for avfoundation/v4l2
-	VideoSize   string // device resolution hint ("1280x720"); empty = device default
+	// Framerate is the capture framerate request (avfoundation, v4l2,
+	// dshow). avfoundation falls back to the preset FPS when zero;
+	// v4l2/dshow omit -framerate when zero (device default).
+	Framerate int
+	// VideoSize is the capture resolution request ("1280x720"). Empty =
+	// the preset resolution on avfoundation / v4l2, device default on
+	// dshow (dshow hard-fails on an unsupported size).
+	VideoSize string
+	// InputFormat is the v4l2 -input_format ("mjpeg", "yuyv422", ...).
+	// Many UVC cameras only reach 1080p30 in MJPEG. Empty = driver default.
+	InputFormat string
 }
 
 // -----------------------------------------------------------------------------
@@ -401,52 +205,60 @@ const (
 //
 // Live encode: Mode = ModeLiveHLS, Input.Kind in {avfoundation/v4l2/dshow/
 // decklink/ndi}. Output is an HLS playlist; the args builder enables
-// `delete_segments` if HLSDeleteOld is set.
+// `delete_segments` if HLSDeleteOld is set. The Supervisor sets
+// HLSAppend on restarts so the playlist / DVR window survives.
 //
 // Upload conversion: Mode = ModeUpload, Input.Kind = InputFile or
-// InputNetwork. Output is an HLS playlist with `append_list` so resuming
-// is safe; `delete_segments` is explicitly NOT used (archive).
+// InputNetwork. Output is an unbounded HLS playlist; `delete_segments`
+// and `append_list` are NOT used — re-running a conversion is a fresh
+// transcode, and appending would duplicate the content.
 type Config struct {
 	Binary string
 
 	Mode    Mode
 	Input   Input
 	Preset  QualityPreset
-	Encoder Encoder // EncoderAuto = pick the best available
-	HWAccel HWAccel // HWAccelNone = let auto-pick decide; HWAccelAuto = use "-hwaccel auto"
+	Encoder Encoder // EncoderAuto = probe and pick the best usable encoder
+	// HWAccel selects input-side decode acceleration:
+	//   HWAccelNone (""): no -hwaccel flag (software decode).
+	//   HWAccelAuto ("auto"): pick the hwaccel matching the encoder
+	//     (videotoolbox/cuda/vaapi/qsv) from `ffmpeg -hwaccels`, falling
+	//     back to `-hwaccel auto` when only a mismatched one exists.
+	//   Any other value: passed verbatim as `-hwaccel <value>`.
+	HWAccel HWAccel
 
 	// HLS output settings.
-	OutputDir          string // directory to write playlist + segments
-	HLSSegmentSeconds  int    // -hls_time; default 2
-	HLSListSize        int    // -hls_list_size; 0 = unlimited (archive default)
-	HLSDeleteOld       bool   // live: drop old segments to bound disk usage
-	HLSPlaylistType    string // "event" / "vod" / ""
-	HLSSegmentType     string // "fmp4" / "mpegts"; default "mpegts" for upload, "fmp4" for live
-	HLSSegmentPattern  string // overrides the default segment_%06d pattern when set
-	HLSInitFile        string // fmp4 init filename ("init.mp4")
-	PlaylistFilename   string // defaults to "master.m3u8"
+	OutputDir         string // directory to write playlist + segments
+	HLSSegmentSeconds int    // -hls_time; default 2
+	HLSListSize       int    // -hls_list_size; 0 = unlimited (archive default)
+	HLSDeleteOld      bool   // live: drop old segments to bound disk usage
+	HLSPlaylistType   string // "event" / "vod" / ""
+	HLSSegmentType    string // "fmp4" / "mpegts"; default "fmp4" for live and HEVC, "mpegts" for H.264 upload
+	HLSSegmentPattern string // overrides the default segment_%06d pattern when set
+	HLSInitFile       string // fmp4 init filename ("init.mp4")
+	PlaylistFilename  string // defaults to "master.m3u8"
+	// HLSAppend (live only) continues an existing playlist instead of
+	// overwriting it: `-hls_flags +append_list+discont_start`. The
+	// Supervisor sets this on every restart after the first run.
+	HLSAppend bool
 
 	// LogLevel passed to `-loglevel`. We emit `-nostats` always so the
-	// stderr stream is parse-friendly; per-line audio meter / progress
-	// goes through `-progress pipe:1`. Default: "error".
+	// stderr stream is parse-friendly; progress goes through
+	// `-progress pipe:1`. Default: "error".
 	LogLevel string
 
 	// DisableAudio drops the audio mapping/encoder entirely.
 	DisableAudio bool
 
-	// StreamKey is logged-but-redacted-if-included. Currently unused by
-	// args (we don't push to RTMP), but kept here so the redaction path
-	// is exercised consistently with easystream's pattern.
+	// StreamKey is redacted from logs if it ever appears.
 	StreamKey string
 
 	// SourceHasMissingPTS hints that the input lacks valid PTS so the
-	// builder adds `-fflags +genpts`. Don't blanket-apply this — it's
-	// only needed for damaged or container-quirk inputs.
+	// builder adds `-fflags +genpts`.
 	SourceHasMissingPTS bool
 
 	// Realtime: when true, use `-re` on file/network sources so the
-	// pipeline paces at wallclock (live-emulation). Off for upload
-	// conversions where we want to transcode as fast as possible.
+	// pipeline paces at wallclock (live-emulation).
 	Realtime bool
 }
 
@@ -498,7 +310,9 @@ func (c Config) Validate() error {
 // -----------------------------------------------------------------------------
 
 // Args builds the argv FFmpeg will see. Returns an error if the config is
-// invalid; never panics. Safe to call from any goroutine.
+// invalid; never panics. Safe to call from any goroutine. Encoder
+// detection (EncoderAuto, HEVC availability) is probed once per process
+// and cached, so repeated calls don't spawn ffmpeg.
 func (c Config) Args() ([]string, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -510,19 +324,24 @@ func (c Config) Args() ([]string, error) {
 		"-loglevel", defaultString(c.LogLevel, "error"),
 		"-progress", "pipe:1",
 	}
-	// `-y` overwrites output without prompting. The live + upload paths
-	// always overwrite (each event has its own directory), so include it
-	// unconditionally. RedactArgsForLog scrubs it from log output to
-	// avoid suggesting "ffmpeg silently overwrote your file."
+	// `-y` overwrites output without prompting. Each event has its own
+	// directory; restarts that must keep the playlist use HLSAppend.
 	args = append(args, "-y")
 
 	encoder := c.EffectiveEncoder()
 	hwaccel := c.EffectiveHWAccel(encoder)
+	plan := c.planVideo(encoder)
+	if plan.warning != "" {
+		warnOnce(plan.warning)
+	}
 
-	// Input-side hwaccel. Must precede `-i`. Mismatched encoder/hwaccel
-	// falls back to `-hwaccel auto` in EffectiveHWAccel which lets
-	// FFmpeg pick a transfer path that still avoids CPU decode where
-	// possible.
+	// VAAPI encode needs a filter-graph device for hwupload. Global
+	// option; emitted before the inputs.
+	if plan.family == EncoderVAAPI {
+		args = append(args, "-vaapi_device", vaapiRenderNode)
+	}
+
+	// Input-side hwaccel. Must precede `-i`.
 	if hwaccel != HWAccelNone {
 		args = append(args, "-hwaccel", string(hwaccel))
 	}
@@ -534,8 +353,7 @@ func (c Config) Args() ([]string, error) {
 	}
 
 	// Live capture devices benefit from -thread_queue_size to avoid
-	// "real-time buffer too full, frame dropped" on slow filesystems
-	// when the disk write side stalls briefly.
+	// "real-time buffer too full, frame dropped".
 	switch c.Input.Kind {
 	case InputAVFoundation, InputV4L2, InputDShow, InputDeckLink, InputNDI:
 		args = append(args, "-thread_queue_size", "1024")
@@ -547,26 +365,20 @@ func (c Config) Args() ([]string, error) {
 	}
 	args = append(args, inputArgs...)
 
-	// Video mapping + encoder
+	// Video mapping, filter chain, encoder.
 	args = append(args, "-map", "0:v:0")
-	// Broadcast-safe limiter — broadcast-tier presets clamp luma to
-	// the legal 16-235 / chroma 16-240 range so out-of-range whites
-	// from a confidence monitor or PC-range graphics don't trip a
-	// downstream QC system. Opt-in via BroadcastSafeAware.
-	if bs, ok := c.Preset.(BroadcastSafeAware); ok && bs.BroadcastSafe() {
-		args = append(args, "-vf", "limiter=min=16:max=235")
+	if vf := c.videoFilterChain(plan); vf != "" {
+		args = append(args, "-vf", vf)
 	}
-	args = append(args, c.encoderArgs(encoder)...)
-	args = append(args, "-pix_fmt", c.Preset.PixelFormat())
+	args = append(args, c.encoderArgs(plan)...)
+	if plan.outPixFmt != "" {
+		args = append(args, "-pix_fmt", plan.outPixFmt)
+	}
 
-	// Output framerate. We pin CFR explicitly: -fps_mode cfr replaces the
-	// deprecated -vsync; this prevents duplicate-PTS frames slipping into
-	// HLS segments on streamcopy-adjacent code paths.
+	// Output framerate. -fps_mode cfr replaces the deprecated -vsync.
 	args = append(args, "-fps_mode", "cfr", "-r", c.Preset.FPSExpr())
 
-	// Force keyframes on a strict 2-second boundary so HLS segment cuts
-	// land on IDR frames. Mirrors easystream's expression; the boundary
-	// value is the same as the GOP-in-seconds derived from FPS().
+	// Force keyframes on the segment boundary so HLS cuts land on IDRs.
 	segSec := c.hlsSegmentSeconds()
 	args = append(args,
 		"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", segSec),
@@ -583,14 +395,15 @@ func (c Config) Args() ([]string, error) {
 		args = append(args, "-an")
 	}
 
-	// HLS output
-	args = append(args, c.hlsOutputArgs()...)
+	args = append(args, c.hlsOutputArgs(plan.hevc)...)
 	return args, nil
 }
 
-// EffectiveEncoder returns the encoder to use, resolving EncoderAuto by
-// querying the binary. The result is cached on the FFmpeg-binary level
-// inside this function only when Config.Encoder == EncoderAuto.
+// EffectiveEncoder returns the encoder backend to use. EncoderAuto is
+// resolved by DetectEncoders + PickEncoder; the detection (including a
+// trial encode per candidate) is cached for the process lifetime, so
+// only the first call spawns ffmpeg. An HEVCAware preset may still
+// promote the result to the family's HEVC encoder in Args().
 func (c Config) EffectiveEncoder() Encoder {
 	if c.Encoder != EncoderAuto {
 		return c.Encoder
@@ -600,7 +413,7 @@ func (c Config) EffectiveEncoder() Encoder {
 
 // EffectiveHWAccel returns the input hwaccel decision. Pass the encoder
 // you'll use so we can match them (videotoolbox decode + videotoolbox
-// encode skips a CPU roundtrip).
+// encode skips a CPU roundtrip). Detection is cached per process.
 func (c Config) EffectiveHWAccel(encoder Encoder) HWAccel {
 	if c.HWAccel == HWAccelNone {
 		return HWAccelNone
@@ -611,6 +424,15 @@ func (c Config) EffectiveHWAccel(encoder Encoder) HWAccel {
 	return PickHWAccel(DetectHWAccels(c.Binary), encoder)
 }
 
+// EffectiveVideoCodec returns the `-c:v` value Args() will emit, after
+// HEVC promotion / fallback. Useful for logging and UI.
+func (c Config) EffectiveVideoCodec() string {
+	if c.Preset == nil {
+		return ""
+	}
+	return c.planVideo(c.EffectiveEncoder()).codec
+}
+
 func (c Config) inputArgs() ([]string, error) {
 	in := c.Input
 	switch in.Kind {
@@ -619,10 +441,7 @@ func (c Config) inputArgs() ([]string, error) {
 		if fr <= 0 {
 			fr = c.Preset.FPS()
 		}
-		size := in.VideoSize
-		if size == "" {
-			size = "1280x720"
-		}
+		size := c.captureSize()
 		videoIdx := in.VideoDevice
 		if videoIdx == "" {
 			videoIdx = "0"
@@ -640,21 +459,31 @@ func (c Config) inputArgs() ([]string, error) {
 		}
 		return args, nil
 	case InputV4L2:
-		size := in.VideoSize
-		if size == "" {
-			size = "1280x720"
-		}
 		dev := in.VideoDevice
 		if dev == "" {
 			dev = "/dev/video0"
 		}
-		return []string{"-f", "v4l2", "-video_size", size, "-i", dev}, nil
-	case InputDShow:
-		dev := in.VideoDevice
-		if dev == "" {
-			dev = "video=Integrated Camera"
+		args := []string{"-f", "v4l2"}
+		if in.InputFormat != "" {
+			args = append(args, "-input_format", in.InputFormat)
 		}
-		return []string{"-f", "dshow", "-i", dev}, nil
+		if in.Framerate > 0 {
+			args = append(args, "-framerate", fmt.Sprintf("%d", in.Framerate))
+		}
+		// v4l2 negotiates the nearest supported size (with a warning)
+		// rather than failing, so asking for the preset size is safe.
+		args = append(args, "-video_size", c.captureSize(), "-i", dev)
+		return args, nil
+	case InputDShow:
+		args := []string{"-f", "dshow"}
+		if in.VideoSize != "" {
+			args = append(args, "-video_size", in.VideoSize)
+		}
+		if in.Framerate > 0 {
+			args = append(args, "-framerate", fmt.Sprintf("%d", in.Framerate))
+		}
+		args = append(args, "-i", dshowInputSpec(in.VideoDevice, in.AudioDevice, c.DisableAudio))
+		return args, nil
 	case InputDeckLink:
 		return []string{"-f", "decklink", "-i", in.VideoDevice}, nil
 	case InputNDI:
@@ -682,10 +511,42 @@ func (c Config) inputArgs() ([]string, error) {
 	return nil, fmt.Errorf("unsupported input kind: %q", in.Kind)
 }
 
+// captureSize is the capture-resolution request: the explicit
+// Input.VideoSize, else the preset's resolution (so the device delivers
+// what we encode instead of being upscaled from 720p).
+func (c Config) captureSize() string {
+	if c.Input.VideoSize != "" {
+		return c.Input.VideoSize
+	}
+	if c.Preset.Width() > 0 && c.Preset.Height() > 0 {
+		return fmt.Sprintf("%dx%d", c.Preset.Width(), c.Preset.Height())
+	}
+	return "1280x720"
+}
+
+// dshowInputSpec builds the DirectShow `-i` value:
+// "video=<name>[:audio=<name>]". Device names from the scanner come
+// without the "video=" prefix, which dshow requires.
+func dshowInputSpec(video, audio string, disableAudio bool) string {
+	video = strings.TrimSpace(video)
+	if video == "" {
+		video = "Integrated Camera"
+	}
+	spec := video
+	if !strings.HasPrefix(strings.ToLower(spec), "video=") && !strings.HasPrefix(strings.ToLower(spec), "audio=") {
+		spec = "video=" + spec
+	}
+	audio = strings.TrimSpace(audio)
+	if !disableAudio && audio != "" && !strings.Contains(strings.ToLower(spec), ":audio=") {
+		audio = strings.TrimPrefix(audio, "audio=")
+		spec += ":audio=" + audio
+	}
+	return spec
+}
+
 // networkInputFlags returns the scheme-appropriate input flags for a
 // network URL. RTSP wants tcp transport on lossy LANs, HLS wants
-// reconnect on intermittent CDNs, MPEG-TS over UDP/RTP wants a big
-// FIFO. Mirrors easystream's NetworkInputArgs.
+// reconnect on intermittent CDNs, MPEG-TS over UDP/RTP wants a big FIFO.
 func networkInputFlags(rawURL string) []string {
 	scheme := ""
 	if i := strings.Index(rawURL, "://"); i > 0 {
@@ -719,7 +580,7 @@ func (c Config) hlsSegmentSeconds() int {
 	return 2
 }
 
-func (c Config) hlsOutputArgs() []string {
+func (c Config) hlsOutputArgs(hevc bool) []string {
 	segSec := c.hlsSegmentSeconds()
 	playlist := c.PlaylistFilename
 	if playlist == "" {
@@ -727,7 +588,8 @@ func (c Config) hlsOutputArgs() []string {
 	}
 	segType := c.HLSSegmentType
 	if segType == "" {
-		if c.Mode == ModeLiveHLS {
+		// HEVC in HLS requires fMP4 for Apple players.
+		if c.Mode == ModeLiveHLS || hevc {
 			segType = "fmp4"
 		} else {
 			segType = "mpegts"
@@ -743,15 +605,19 @@ func (c Config) hlsOutputArgs() []string {
 	}
 
 	flags := "independent_segments+temp_file"
-	switch c.Mode {
-	case ModeLiveHLS:
+	if c.Mode == ModeLiveHLS {
 		if c.HLSDeleteOld {
 			flags += "+delete_segments"
 		}
-	case ModeUpload:
-		// Resumable archive: never delete, append on restart.
-		flags += "+append_list"
+		// Restart: continue the existing playlist (media sequence and
+		// segment numbering carry on, an EXT-X-DISCONTINUITY marks the
+		// splice) instead of wiping the DVR window.
+		if c.HLSAppend {
+			flags += "+append_list+discont_start"
+		}
 	}
+	// ModeUpload: no append_list. A re-run is a full re-transcode;
+	// appending would duplicate every segment in the playlist.
 
 	listSize := c.HLSListSize
 	if c.Mode == ModeUpload {
@@ -785,15 +651,36 @@ func (c Config) hlsOutputArgs() []string {
 	return args
 }
 
+// RunInitFilename returns the fMP4 init-segment name for supervisor run
+// number `run` (0 = first run). Run 0 keeps the configured name; later
+// runs get a "-rN" suffix so a restart never overwrites the init segment
+// earlier segments were encoded against.
+func RunInitFilename(base string, run int) string {
+	if base == "" {
+		base = "init.mp4"
+	}
+	if run <= 0 {
+		return base
+	}
+	ext := ""
+	if i := strings.LastIndex(base, "."); i > 0 {
+		ext = base[i:]
+		base = base[:i]
+	}
+	return fmt.Sprintf("%s-r%d%s", base, run, ext)
+}
+
+// -----------------------------------------------------------------------------
+// Optional preset capabilities
+// -----------------------------------------------------------------------------
+
 // ColorPresetAware is an optional capability interface that
 // QualityPreset implementations can satisfy to surface broadcast-grade
-// VUI metadata. When present, encoderArgs emits -color_primaries /
-// -color_trc / -colorspace / -color_range BEFORE -c:v so hardware
-// encoders bake the hints into the SPS at init.
-//
-// Implemented by internal/quality.FFmpegPreset; not implemented by
-// the local DefaultPreset / SimplePreset fallbacks (those stay
-// implicit / unspecified — historic behaviour).
+// VUI metadata. When present the builder (a) tags frames in the -vf
+// chain with `setparams` (FFmpeg 7+ lets frame side data override the
+// output-side flags, so the filter is what actually sticks) and (b)
+// still emits -color_primaries / -color_trc / -colorspace /
+// -color_range before -c:v for the encoder's SPS/VUI.
 type ColorPresetAware interface {
 	ColorPrimaries() string
 	ColorTransfer() string
@@ -802,31 +689,197 @@ type ColorPresetAware interface {
 }
 
 // RateControlAware lets a preset declare its rate-control envelope
-// (CBR vs VBR, plus the VBV ceiling and buffer size). encoderArgs
-// honours this on the libx264 path with `nal-hrd=cbr filler=1` plus
-// 1-second VBV when RateControlMode() == "cbr".
+// (CBR vs VBR, plus the VBV ceiling and buffer size).
 type RateControlAware interface {
 	RateControlMode() string
 	VideoMaxBitrate() string
 	VideoBufSize() string
 }
 
-// BroadcastSafeAware lets a preset opt INTO a 16-235 luma limiter
-// applied as a -vf filter. Set on broadcast-tier presets so out-of-
-// range whites don't trip downstream QC systems.
+// BroadcastSafeAware lets a preset opt INTO the broadcast-legal limiter
+// (luma 16-235, chroma 16-240, scaled for 10-bit) in the -vf chain.
 type BroadcastSafeAware interface {
 	BroadcastSafe() bool
 }
 
-// encoderArgs returns the encoder-specific flags. Each hardware encoder
-// has its own knobs because they don't share x264's CLI surface.
+// HEVCAware lets a preset request HEVC output. When PrefersHEVC() is
+// true the encoder family is promoted to its HEVC sibling
+// (libx264 -> libx265, h264_videotoolbox -> hevc_videotoolbox,
+// h264_nvenc -> hevc_nvenc). If that encoder isn't usable (or the
+// family has no HEVC path: VAAPI, QSV), the encode falls back to 8-bit
+// H.264 on the same family and a warning is logged.
+type HEVCAware interface {
+	PrefersHEVC() bool
+}
+
+// -----------------------------------------------------------------------------
+// Video codec plan
+// -----------------------------------------------------------------------------
+
+// videoPlan is the resolved video encode: which codec, which profile,
+// which pixel formats. Computed once per Args() call.
+type videoPlan struct {
+	family    Encoder // H.264 backend family (x264 / vt / nvenc / vaapi / qsv)
+	codec     string  // -c:v value
+	hevc      bool
+	profile   string // -profile:v value
+	swPixFmt  string // software format pinned in the -vf chain
+	outPixFmt string // -pix_fmt value ("" = omit, VAAPI)
+	warning   string // non-empty when we fell back from HEVC
+}
+
+func (c Config) planVideo(encoder Encoder) videoPlan {
+	family := encoderFamily(encoder)
+	if family == EncoderAuto {
+		family = EncoderX264
+	}
+	wantHEVC := isHEVCEncoder(encoder)
+	if h, ok := c.Preset.(HEVCAware); ok && h.PrefersHEVC() {
+		wantHEVC = true
+	}
+	presetPixFmt := c.Preset.PixelFormat()
+	if presetPixFmt == "" {
+		presetPixFmt = "yuv420p"
+	}
+
+	if wantHEVC {
+		sibling := hevcSibling(family)
+		if sibling != "" && ProbeEncoder(c.Binary, string(sibling)) {
+			tenBit := isTenBit(presetPixFmt)
+			p := videoPlan{
+				family:   family,
+				codec:    string(sibling),
+				hevc:     true,
+				profile:  "main",
+				swPixFmt: presetPixFmt,
+			}
+			if tenBit {
+				p.profile = "main10"
+			}
+			p.outPixFmt = presetPixFmt
+			if tenBit && (sibling == EncoderHEVCVideoToolbox || sibling == EncoderHEVCNVENC) {
+				// VT / NVENC take semi-planar 10-bit, not yuv420p10le.
+				p.outPixFmt = "p010le"
+			}
+			return p
+		}
+		h264 := c.planH264(family, true)
+		missing := string(sibling)
+		if missing == "" {
+			missing = "an HEVC encoder for " + string(family)
+		}
+		h264.warning = fmt.Sprintf("ffmpeg: preset %s wants HEVC but %s is not usable; falling back to 8-bit H.264 (%s)",
+			c.Preset.ID(), missing, h264.codec)
+		return h264
+	}
+	return c.planH264(family, false)
+}
+
+func (c Config) planH264(family Encoder, fallbackFromHEVC bool) videoPlan {
+	pix := c.Preset.PixelFormat()
+	if pix == "" {
+		pix = "yuv420p"
+	}
+	profile := c.Preset.Profile()
+	if fallbackFromHEVC || (family != EncoderX264 && isTenBit(pix)) {
+		// Hardware H.264 encoders are 8-bit only, and an HEVC preset's
+		// 10-bit format doesn't apply after falling back.
+		pix = "yuv420p"
+	}
+	switch profile {
+	case "", "main10", "main12", "rext":
+		profile = "high"
+	}
+	p := videoPlan{
+		family:    family,
+		codec:     string(family),
+		profile:   profile,
+		swPixFmt:  pix,
+		outPixFmt: pix,
+	}
+	if family == EncoderVAAPI {
+		// Frames are uploaded to the GPU at the end of the -vf chain;
+		// -pix_fmt would fight the hw frame format.
+		p.outPixFmt = ""
+	}
+	return p
+}
+
+func isTenBit(pixFmt string) bool {
+	return strings.Contains(pixFmt, "10le") || strings.Contains(pixFmt, "10be") || strings.HasPrefix(pixFmt, "p010")
+}
+
+// videoFilterChain builds the single -vf chain:
 //
-// When the bound preset satisfies the optional ColorPresetAware /
-// RateControlAware interfaces, the relevant broadcast-grade flags
-// are emitted automatically. Plain QualityPreset implementations
-// (DefaultPreset / SimplePreset) keep working with the legacy
-// behaviour — bitrate / profile / level only.
-func (c Config) encoderArgs(encoder Encoder) []string {
+//	scale=W:H[:out_range=R], format=<sw pix fmt>,
+//	setparams=color_primaries=..:color_trc=..:colorspace=..:range=..,
+//	limiter (luma) , limiter (chroma),
+//	format=nv12,hwupload            (VAAPI only)
+func (c Config) videoFilterChain(plan videoPlan) string {
+	var parts []string
+	cp, colorAware := c.Preset.(ColorPresetAware)
+
+	if w, h := c.Preset.Width(), c.Preset.Height(); w > 0 && h > 0 {
+		scale := fmt.Sprintf("scale=%d:%d", w, h)
+		if colorAware && cp.ColorRange() != "" {
+			// Convert (not just retag) full-range webcam / MJPEG input.
+			scale += ":out_range=" + cp.ColorRange()
+		}
+		parts = append(parts, scale)
+	}
+	if plan.swPixFmt != "" {
+		// Pin the software format so the limiter sees a known bit depth.
+		parts = append(parts, "format="+plan.swPixFmt)
+	}
+	if colorAware {
+		sp := []string{}
+		if v := cp.ColorPrimaries(); v != "" {
+			sp = append(sp, "color_primaries="+v)
+		}
+		if v := cp.ColorTransfer(); v != "" {
+			sp = append(sp, "color_trc="+v)
+		}
+		if v := cp.ColorSpace(); v != "" {
+			sp = append(sp, "colorspace="+v)
+		}
+		if v := cp.ColorRange(); v != "" {
+			sp = append(sp, "range="+v)
+		}
+		if len(sp) > 0 {
+			parts = append(parts, "setparams="+strings.Join(sp, ":"))
+		}
+	}
+	if bs, ok := c.Preset.(BroadcastSafeAware); ok && bs.BroadcastSafe() {
+		parts = append(parts, limiterFilters(plan.swPixFmt)...)
+	}
+	if plan.family == EncoderVAAPI && !plan.hevc {
+		parts = append(parts, "format=nv12", "hwupload")
+	}
+	return strings.Join(parts, ",")
+}
+
+// limiterFilters clamps to the broadcast-legal range: luma (plane 0,
+// planes=1) 16-235, chroma (planes 1+2, planes=6) 16-240, scaled x4 for
+// 10-bit formats.
+func limiterFilters(pixFmt string) []string {
+	shift := 1
+	if isTenBit(pixFmt) {
+		shift = 4
+	}
+	return []string{
+		fmt.Sprintf("limiter=min=%d:max=%d:planes=1", 16*shift, 235*shift),
+		fmt.Sprintf("limiter=min=%d:max=%d:planes=6", 16*shift, 240*shift),
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Encoder args
+// -----------------------------------------------------------------------------
+
+// encoderArgs returns the encoder-specific flags for a resolved plan.
+// Each hardware encoder has its own knobs because they don't share
+// x264's CLI surface.
+func (c Config) encoderArgs(plan videoPlan) []string {
 	preset := c.Preset
 	level := preset.Level()
 	levelNoDot := strings.ReplaceAll(level, ".", "")
@@ -837,11 +890,8 @@ func (c Config) encoderArgs(encoder Encoder) []string {
 	}
 	// Upload conversions explicitly do NOT use zerolatency — it disables
 	// B-frames and hurts quality at the same bitrate.
-	if c.Mode == ModeUpload {
-		wantsTune = preset.Tune()
-		if wantsTune == "zerolatency" {
-			wantsTune = ""
-		}
+	if c.Mode == ModeUpload && wantsTune == "zerolatency" {
+		wantsTune = ""
 	}
 
 	bfArgs := []string{}
@@ -849,11 +899,8 @@ func (c Config) encoderArgs(encoder Encoder) []string {
 		bfArgs = []string{"-bf", "0"}
 	}
 
-	// Color VUI signalling lives ahead of -c:v so the encoder bakes
-	// the values into the SPS at init. The narrow QualityPreset
-	// interface doesn't carry color metadata — opt-in via the
-	// ColorPresetAware extension. Presets without it keep the
-	// historic "unspecified" behaviour.
+	// Color VUI flags ahead of -c:v so the encoder bakes them into the
+	// SPS. The setparams filter in the -vf chain tags the frames.
 	var colorArgs []string
 	if cp, ok := preset.(ColorPresetAware); ok {
 		colorArgs = []string{
@@ -864,15 +911,8 @@ func (c Config) encoderArgs(encoder Encoder) []string {
 		}
 	}
 
-	// Rate control — broadcast tier presets ship CBR with 1-second
-	// VBV. Consumer presets ship VBR with 2x headroom. Implementations
-	// that don't satisfy RateControlAware get the legacy "soft CBR"
-	// path (maxrate == bufsize == target on x264, -rc cbr on NVENC).
-	//
-	// rateControlAware tracks whether we should emit RateControlAware-
-	// specific extras (nal-hrd=cbr on x264). The legacy SimplePreset
-	// path keeps the historic "no x264-params" behavior to avoid
-	// churning every caller that relied on it.
+	// Rate control — RateControlAware presets declare CBR/VBR + VBV.
+	// Others get the legacy "soft CBR" path (maxrate == bufsize == target).
 	rcMode := "cbr"
 	maxrate := preset.VideoBitrate()
 	bufsize := preset.VideoBitrate()
@@ -888,36 +928,39 @@ func (c Config) encoderArgs(encoder Encoder) []string {
 			bufsize = v
 		}
 	}
+	gop := preset.GOP()
 
-	switch encoder {
-	case EncoderVideoToolbox:
-		args := append([]string{}, colorArgs...)
-		args = append(args,
-			"-c:v", "h264_videotoolbox",
-			"-profile:v", preset.Profile(),
-			"-level:v", level,
-			"-allow_sw", "1",
-			"-b:v", preset.VideoBitrate(),
-		)
+	args := append([]string{}, colorArgs...)
+	switch Encoder(plan.codec) {
+	case EncoderVideoToolbox, EncoderHEVCVideoToolbox:
+		args = append(args, "-c:v", plan.codec, "-profile:v", plan.profile)
+		if !plan.hevc {
+			args = append(args, "-level:v", level)
+		}
+		args = append(args, "-allow_sw", "1", "-b:v", preset.VideoBitrate())
 		if c.Mode == ModeLiveHLS {
 			args = append(args, "-realtime", "1")
 			if rcMode == "cbr" {
 				args = append(args, "-constant_bit_rate", "1")
 			}
 		}
-		args = append(args, bfArgs...)
-		return args
-	case EncoderNVENC:
-		args := append([]string{}, colorArgs...)
+		if plan.hevc {
+			args = append(args, "-tag:v", "hvc1")
+		}
+	case EncoderNVENC, EncoderHEVCNVENC:
 		nvencRC := "cbr"
 		if rcMode == "vbr" || rcMode == "crf" || rcMode == "cqp" {
 			nvencRC = "vbr"
 		}
 		args = append(args,
-			"-c:v", "h264_nvenc",
-			"-preset", defaultString(preset.VideoEncoderPreset(), "p4"),
-			"-profile:v", preset.Profile(),
-			"-level:v", level,
+			"-c:v", plan.codec,
+			"-preset", nvencPreset(preset.VideoEncoderPreset()),
+			"-profile:v", plan.profile,
+		)
+		if !plan.hevc {
+			args = append(args, "-level:v", level)
+		}
+		args = append(args,
 			"-rc", nvencRC,
 			"-no-scenecut", "1",
 			"-forced-idr", "1",
@@ -926,64 +969,119 @@ func (c Config) encoderArgs(encoder Encoder) []string {
 			"-maxrate", maxrate,
 			"-bufsize", bufsize,
 		)
-		args = append(args, bfArgs...)
-		return args
+		if plan.hevc {
+			args = append(args, "-tag:v", "hvc1")
+		}
 	case EncoderVAAPI:
-		args := append([]string{}, colorArgs...)
 		args = append(args,
-			"-vaapi_device", "/dev/dri/renderD128",
-			"-c:v", "h264_vaapi",
-			"-profile:v", preset.Profile(),
+			"-c:v", plan.codec,
+			"-profile:v", plan.profile,
 			"-level", levelNoDot,
 			"-b:v", preset.VideoBitrate(),
 			"-maxrate", maxrate,
 			"-bufsize", bufsize,
 		)
-		args = append(args, bfArgs...)
-		return args
 	case EncoderQSV:
-		args := append([]string{}, colorArgs...)
 		args = append(args,
-			"-c:v", "h264_qsv",
-			"-preset", defaultString(preset.VideoEncoderPreset(), "veryfast"),
-			"-profile:v", preset.Profile(),
+			"-c:v", plan.codec,
+			"-preset", qsvPreset(preset.VideoEncoderPreset()),
+			"-profile:v", plan.profile,
 			"-level", levelNoDot,
 			"-b:v", preset.VideoBitrate(),
 			"-maxrate", maxrate,
 			"-bufsize", bufsize,
 		)
-		args = append(args, bfArgs...)
-		return args
-	default: // libx264
-		args := append([]string{}, colorArgs...)
+	case EncoderX265:
+		params := []string{
+			fmt.Sprintf("keyint=%d", gop),
+			fmt.Sprintf("min-keyint=%d", gop),
+			"scenecut=0",
+			"open-gop=0",
+			"log-level=error",
+		}
 		args = append(args,
-			"-c:v", "libx264",
+			"-c:v", plan.codec,
 			"-preset", defaultString(preset.VideoEncoderPreset(), "veryfast"),
-			"-profile:v", preset.Profile(),
+			"-profile:v", plan.profile,
+			"-b:v", preset.VideoBitrate(),
+			"-maxrate", maxrate,
+			"-bufsize", bufsize,
+			"-x265-params", strings.Join(params, ":"),
+		)
+		if wantsTune != "" {
+			args = append(args, "-tune", wantsTune)
+		}
+		args = append(args, "-tag:v", "hvc1")
+	default: // libx264
+		args = append(args,
+			"-c:v", plan.codec,
+			"-preset", defaultString(preset.VideoEncoderPreset(), "veryfast"),
+			"-profile:v", plan.profile,
 			"-level:v", level,
 			"-b:v", preset.VideoBitrate(),
 			"-maxrate", maxrate,
 			"-bufsize", bufsize,
 		)
-		// Broadcast CBR: declare HRD parameters in the SPS VUI and
-		// emit filler NALs so strict downstream re-muxers see CBR,
-		// not VBR-with-filler. Gated on RateControlAware so the
-		// legacy SimplePreset path keeps its historic libx264
-		// argv (no -x264-params).
+		// Broadcast CBR: declare HRD parameters in the SPS VUI and emit
+		// filler NALs. Gated on RateControlAware so the legacy
+		// SimplePreset path keeps its historic argv.
 		if rateControlAware && rcMode == "cbr" {
-			gopFrames := preset.GOP()
-			x264Params := fmt.Sprintf(
-				"nal-hrd=cbr:filler=1:keyint=%d:min-keyint=%d:scenecut=0:open-gop=0",
-				gopFrames, gopFrames,
-			)
-			args = append(args, "-x264-params", x264Params)
+			args = append(args, "-x264-params", fmt.Sprintf(
+				"nal-hrd=cbr:filler=1:keyint=%d:min-keyint=%d:scenecut=0:open-gop=0", gop, gop))
 		}
 		if wantsTune != "" {
 			args = append(args, "-tune", wantsTune)
 		}
-		args = append(args, bfArgs...)
-		return args
 	}
+	args = append(args, bfArgs...)
+	return args
+}
+
+// x264PresetRank orders the x264 speed presets fastest-first.
+var x264PresetRank = map[string]int{
+	"ultrafast": 0, "superfast": 1, "veryfast": 2, "faster": 3,
+	"fast": 4, "medium": 5, "slow": 6, "slower": 7, "veryslow": 8, "placebo": 8,
+}
+
+// nvencPreset translates an x264-style preset name to NVENC p1..p7
+// (p1 fastest). "p1".."p7" pass through; empty / unknown -> p4.
+func nvencPreset(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if len(name) == 2 && name[0] == 'p' && name[1] >= '1' && name[1] <= '7' {
+		return name
+	}
+	switch rank, ok := x264PresetRank[name]; {
+	case !ok:
+		return "p4"
+	case rank <= 0:
+		return "p1"
+	case rank == 1:
+		return "p2"
+	case rank <= 3:
+		return "p3"
+	case rank == 4:
+		return "p4"
+	case rank == 5:
+		return "p5"
+	case rank == 6:
+		return "p6"
+	default:
+		return "p7"
+	}
+}
+
+// qsvPreset maps an x264-style preset to the QSV keyword space
+// (veryfast..veryslow). ultrafast/superfast clamp to veryfast; NVENC
+// pN names and unknowns map to the default veryfast.
+func qsvPreset(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch name {
+	case "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow":
+		return name
+	case "placebo":
+		return "veryslow"
+	}
+	return "veryfast"
 }
 
 func (c Config) audioEncoderArgs() []string {
@@ -1008,125 +1106,28 @@ func (c Config) audioEncoderArgs() []string {
 }
 
 // -----------------------------------------------------------------------------
-// Redaction
-// -----------------------------------------------------------------------------
-
-// RedactedCredentialSentinel replaces credentials in URLs that get logged.
-const RedactedCredentialSentinel = "REDACTED"
-
-// secretQueryParams names URL query parameters whose values are always
-// sensitive. Their values are scrubbed alongside any userinfo (user:pass@)
-// component when URLs get serialised for logs.
-var secretQueryParams = map[string]bool{
-	"passphrase": true,
-	"password":   true,
-	"token":      true,
-	"key":        true,
-	"secret":     true,
-}
-
-// RedactURLCredentials returns u with embedded credentials replaced by
-// the redaction sentinel.
-//
-//   - userinfo (rtsp://user:pass@host/p -> rtsp://REDACTED:REDACTED@host/p)
-//   - secret query params (srt://...?passphrase=X -> ?passphrase=REDACTED)
-func RedactURLCredentials(u string) string {
-	if u == "" {
-		return u
-	}
-	parsed, err := url.Parse(u)
-	if err != nil {
-		return redactRawURL(u)
-	}
-	if parsed.User != nil {
-		parsed.User = url.UserPassword(RedactedCredentialSentinel, RedactedCredentialSentinel)
-	}
-	if parsed.RawQuery != "" {
-		q := parsed.Query()
-		changed := false
-		for k := range q {
-			if secretQueryParams[strings.ToLower(k)] {
-				q.Set(k, RedactedCredentialSentinel)
-				changed = true
-			}
-		}
-		if changed {
-			parsed.RawQuery = q.Encode()
-		}
-	}
-	return parsed.String()
-}
-
-func redactRawURL(u string) string {
-	schemeIdx := strings.Index(u, "://")
-	if schemeIdx < 0 {
-		return u
-	}
-	rest := u[schemeIdx+3:]
-	atIdx := strings.Index(rest, "@")
-	slashIdx := strings.Index(rest, "/")
-	if atIdx < 0 || (slashIdx >= 0 && atIdx > slashIdx) {
-		return u
-	}
-	return u[:schemeIdx+3] + RedactedCredentialSentinel + ":" + RedactedCredentialSentinel + rest[atIdx:]
-}
-
-// urlInLogRegex matches URL-shaped substrings inside a log line.
-var urlInLogRegex = regexp.MustCompile(`(?i)(rtmp|rtmps|rtsp|rtsps|srt|http|https|udp|rtp)://[^\s'"]+`)
-
-// RedactURLsInLog scans a free-form log line for URLs and runs each one
-// through RedactURLCredentials, preserving trailing punctuation.
-func RedactURLsInLog(line string) string {
-	return urlInLogRegex.ReplaceAllStringFunc(line, func(match string) string {
-		trailing := ""
-		for len(match) > 0 {
-			last := match[len(match)-1]
-			if last == ',' || last == '.' || last == ')' || last == ']' || last == ';' || last == ':' {
-				trailing = string(last) + trailing
-				match = match[:len(match)-1]
-				continue
-			}
-			break
-		}
-		return RedactURLCredentials(match) + trailing
-	})
-}
-
-// redactStreamKey replaces a stream key in a log line with <redacted>.
-// Skipped when the key is empty or shorter than 8 characters (those are
-// almost certainly not a real key — refusing to redact "abc" prevents
-// matching common words and leaking surrounding context).
-func redactStreamKey(line, key string) string {
-	if key == "" || len(key) < 8 {
-		return line
-	}
-	if !strings.Contains(line, key) {
-		return line
-	}
-	return strings.ReplaceAll(line, key, "<redacted>")
-}
-
-// RedactArgsForLog returns a copy of argv with secrets scrubbed. Used to
-// emit FFmpeg invocations into logs without leaking RTSP/SRT credentials
-// or the stream key. The streamKey arg redacts a fixed sentinel value
-// (live encode key); URL-shaped args go through RedactURLCredentials.
-//
-// `-y` is preserved verbatim — it's not a secret. The argument is documented
-// here because the original spec asked us to mention it: callers who don't
-// want `-y` shown in logs can pass strings.NewReplacer / their own filter.
-func RedactArgsForLog(argv []string, streamKey string) []string {
-	out := make([]string, len(argv))
-	for i, a := range argv {
-		redacted := RedactURLsInLog(a)
-		redacted = redactStreamKey(redacted, streamKey)
-		out[i] = redacted
-	}
-	return out
-}
-
-// -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+var (
+	warnedMu sync.Mutex
+	warned   = map[string]bool{}
+	// warnf is the warning sink; swapped in tests.
+	warnf = log.Printf
+)
+
+// warnOnce logs msg the first time it is seen. Args() runs on every
+// supervisor restart, so a fallback warning would otherwise repeat.
+func warnOnce(msg string) {
+	warnedMu.Lock()
+	seen := warned[msg]
+	warned[msg] = true
+	fn := warnf
+	warnedMu.Unlock()
+	if !seen {
+		fn("%s", msg)
+	}
+}
 
 func defaultString(value, fallback string) string {
 	if value == "" {

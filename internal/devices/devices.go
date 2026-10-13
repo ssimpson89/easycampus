@@ -53,7 +53,7 @@ type Device struct {
 type DeviceList struct {
 	Video     []Device  `json:"video"`
 	Audio     []Device  `json:"audio"`
-	Platform  string    `json:"platform"`  // platform backend (avfoundation/dshow/v4l2)
+	Platform  string    `json:"platform"` // platform backend (avfoundation/dshow/v4l2)
 	ScannedAt time.Time `json:"scannedAt"`
 }
 
@@ -299,40 +299,96 @@ func parseAVFoundation(output string) DeviceList {
 }
 
 // --- dshow parser ---
-var dshowDeviceRe = regexp.MustCompile(`"([^"]+)"\s+\((video|audio)\)`)
+//
+// FFmpeg >= 5.0 prints one line per device with its media types:
+//
+//	[dshow @ 0000020f] "Integrated Camera" (video)
+//	[dshow @ 0000020f]   Alternative name "@device_pnp_\\?\usb#..."
+//	[dshow @ 0000020f] "Microphone (Realtek Audio)" (audio)
+//	[dshow @ 0000020f] "Decklink Video Capture" (audio, video)
+//
+// Older builds print section headers ("DirectShow video devices") and
+// bare quoted names. Both are handled; combined (audio, video) devices
+// are listed in both Video and Audio.
+var (
+	dshowDeviceRe = regexp.MustCompile(`"([^"]+)"\s+\(([a-z, ]+)\)\s*$`)
+	dshowLegacyRe = regexp.MustCompile(`^(?:\[[^\]]*\]\s*)?"([^"]+)"\s*$`)
+)
 
 func parseDshow(output string) DeviceList {
 	list := DeviceList{}
 	scanner := bufio.NewScanner(strings.NewReader(output))
-	for scanner.Scan() {
-		matches := dshowDeviceRe.FindStringSubmatch(scanner.Text())
-		if len(matches) < 3 {
-			continue
-		}
-		d := Device{
-			Index:   matches[1],
-			Name:    matches[1],
-			Kind:    matches[2],
-			Backend: "dshow",
-		}
-		if d.Kind == "video" {
+	section := "" // legacy format only
+	add := func(name, kind string) {
+		d := Device{Index: name, Name: name, Kind: kind, Backend: "dshow"}
+		if kind == "video" {
 			list.Video = append(list.Video, d)
 		} else {
 			list.Audio = append(list.Audio, d)
+		}
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		lower := strings.ToLower(line)
+		switch {
+		case strings.Contains(lower, "directshow video devices"):
+			section = "video"
+			continue
+		case strings.Contains(lower, "directshow audio devices"):
+			section = "audio"
+			continue
+		case strings.Contains(lower, "alternative name"):
+			continue
+		}
+		if m := dshowDeviceRe.FindStringSubmatch(line); len(m) == 3 {
+			types := m[2]
+			if strings.Contains(types, "video") {
+				add(m[1], "video")
+			}
+			if strings.Contains(types, "audio") {
+				add(m[1], "audio")
+			}
+			continue
+		}
+		if section != "" {
+			if m := dshowLegacyRe.FindStringSubmatch(strings.TrimSpace(line)); len(m) == 2 {
+				add(m[1], section)
+			}
 		}
 	}
 	return list
 }
 
 // --- decklink parser ---
-var deckLinkDeviceRe = regexp.MustCompile(`\[decklink[^]]*\]\s+'([^']+)'`)
+//
+// libavdevice prints (decklink_common.cpp, ff_decklink_list_devices_legacy):
+//
+//	[decklink @ 0x7f..] Blackmagic DeckLink input devices:
+//	[decklink @ 0x7f..] \t'DeckLink Mini Recorder'
+//
+// Device lines are only accepted after that header, so unrelated quoted
+// strings in error output aren't mistaken for devices.
+var (
+	deckLinkHeaderRe = regexp.MustCompile(`(?i)Blackmagic DeckLink .*devices:`)
+	deckLinkDeviceRe = regexp.MustCompile(`^(?:\[[^\]]*\]\s?)?\s*'([^']+)'\s*$`)
+)
 
 func parseDeckLink(output string) DeviceList {
 	list := DeviceList{}
 	scanner := bufio.NewScanner(strings.NewReader(output))
+	inList := false
 	for scanner.Scan() {
-		matches := deckLinkDeviceRe.FindStringSubmatch(scanner.Text())
+		line := scanner.Text()
+		if deckLinkHeaderRe.MatchString(line) {
+			inList = true
+			continue
+		}
+		if !inList {
+			continue
+		}
+		matches := deckLinkDeviceRe.FindStringSubmatch(line)
 		if len(matches) < 2 {
+			inList = false // list ended
 			continue
 		}
 		name := strings.TrimSpace(matches[1])
@@ -349,17 +405,31 @@ func parseDeckLink(output string) DeviceList {
 }
 
 // --- NDI parser ---
-// FFmpeg's libndi_newtek source-discovery prints one source per line, with
-// the source name in single quotes. There's variation between builds, so
-// we accept any line that contains "NDI" and a quoted name.
-var ndiSourceRe = regexp.MustCompile(`'([^']+)'`)
+//
+// libndi_newtek -find_sources prints a header then one line per source:
+//
+//	[libndi_newtek @ 0x..] -------------- 2 NDI Sources--------------------
+//	[libndi_newtek @ 0x..] 'STUDIO (CAM1)'	'192.168.1.20:5961'
+//
+// Only lines after the header, carrying a quoted name (and usually a
+// quoted address), are sources. The "[libndi_newtek @" log prefix
+// contains "ndi", so a bare substring match accepted every log line.
+var (
+	ndiHeaderRe = regexp.MustCompile(`(?i)\d+\s+NDI Sources`)
+	ndiSourceRe = regexp.MustCompile(`^(?:\[[^\]]*\]\s*)?'([^']+)'(?:\s+'[^']*')?\s*$`)
+)
 
 func parseNDI(output string) DeviceList {
 	list := DeviceList{}
 	scanner := bufio.NewScanner(strings.NewReader(output))
+	inList := false
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.Contains(line, "NDI") && !strings.Contains(line, "ndi") {
+		if ndiHeaderRe.MatchString(line) {
+			inList = true
+			continue
+		}
+		if !inList {
 			continue
 		}
 		matches := ndiSourceRe.FindStringSubmatch(line)

@@ -2,12 +2,12 @@
 // flag fragments each preset translates to.
 //
 // The package is deliberately self-contained: it has no dependency on the
-// ffmpeg supervisor, the HTTP layer, or the configuration loader. The
-// supervisor (owned by a parallel agent under internal/ffmpeg/) calls
-// BuildFFmpegArgs() with a Preset and an Encoder and splices the result
-// into the larger argv it constructs for input/output handling. Keeping
-// the boundary here narrow lets the table grow with new tiers without
-// touching the process-management code.
+// ffmpeg supervisor, the HTTP layer, or the configuration loader. Presets
+// reach internal/ffmpeg through the FFmpegPreset adapter
+// (ffmpeg_adapter.go), which satisfies ffmpeg.QualityPreset plus its
+// optional capability interfaces; the argv itself is built by
+// ffmpeg.Config.Args(). Keeping the boundary here narrow lets the table
+// grow with new tiers without touching the process-management code.
 //
 // Tier model
 //
@@ -77,14 +77,14 @@ const (
 type Encoder string
 
 const (
-	EncoderX264               Encoder = "libx264"
-	EncoderX265               Encoder = "libx265"
-	EncoderH264VideoToolbox   Encoder = "h264_videotoolbox"
-	EncoderHEVCVideoToolbox   Encoder = "hevc_videotoolbox"
-	EncoderH264NVENC          Encoder = "h264_nvenc"
-	EncoderHEVCNVENC          Encoder = "hevc_nvenc"
-	EncoderH264QSV            Encoder = "h264_qsv"
-	EncoderH264VAAPI          Encoder = "h264_vaapi"
+	EncoderX264             Encoder = "libx264"
+	EncoderX265             Encoder = "libx265"
+	EncoderH264VideoToolbox Encoder = "h264_videotoolbox"
+	EncoderHEVCVideoToolbox Encoder = "hevc_videotoolbox"
+	EncoderH264NVENC        Encoder = "h264_nvenc"
+	EncoderHEVCNVENC        Encoder = "hevc_nvenc"
+	EncoderH264QSV          Encoder = "h264_qsv"
+	EncoderH264VAAPI        Encoder = "h264_vaapi"
 )
 
 // Rational represents a frame rate as a fraction. 23.976 must be
@@ -448,7 +448,7 @@ var Presets = []Preset{
 		AudioSampleRate: 48000,
 		AudioChannels:   2,
 		H264Level:       "4.2", // 1080p60 exceeds 4.1's macroblock-rate cap (245.76 k MB/s); 4.2 caps at 522 k which covers it.
-		MinUploadKbps:   14500,
+		MinUploadKbps:   14600, // (12000+160)*1.2 = 14592, rounded up
 		RecommendedHW:   []Encoder{EncoderH264NVENC, EncoderH264VideoToolbox, EncoderH264QSV, EncoderX264},
 		Notes:           "1080p60 with NVENC/VideoToolbox. Requires sustained 15+ Mbps upload.",
 	},
@@ -500,7 +500,7 @@ var Presets = []Preset{
 		AudioSampleRate: 48000,
 		AudioChannels:   2,
 		H264Level:       "4.2",
-		MinUploadKbps:   18000,
+		MinUploadKbps:   18300, // (15000+192)*1.2 = 18230, rounded up
 		RecommendedHW:   []Encoder{EncoderX264, EncoderH264NVENC, EncoderH264QSV, EncoderH264VideoToolbox},
 		BroadcastSafe:   true,
 		Notes:           "1080p60 broadcast CBR. Pairs with a 25 Mbps committed-rate uplink.",
@@ -524,7 +524,7 @@ var Presets = []Preset{
 		AudioSampleRate: 48000,
 		AudioChannels:   2,
 		H264Level:       "5.1", // 2160p30 = ~245.76 k MB/s × 4 panels = beyond H.264 4.1; SPS gets HEVC equivalent on x265/hevc_nvenc paths, level is here for argv consistency.
-		MinUploadKbps:   42000,
+		MinUploadKbps:   42300, // (35000+192)*1.2 = 42230, rounded up
 		RecommendedHW:   []Encoder{EncoderHEVCNVENC, EncoderHEVCVideoToolbox, EncoderX265},
 		BroadcastSafe:   true,
 		Notes:           "2160p30 HEVC. BT.2020 primaries; 10-bit chroma. Requires 50+ Mbps committed uplink.",
@@ -783,262 +783,6 @@ func isHEVCPreset(p Preset) bool {
 		}
 	}
 	return true
-}
-
-// BuildFFmpegArgs returns the encoder-side ffmpeg argv fragment for
-// a preset on a specific encoder. The fragment includes:
-//
-//   - color signalling (-color_primaries / -color_trc / -colorspace
-//     / -color_range) emitted BEFORE -c:v so hardware encoders bake
-//     the VUI hints into their SPS at init.
-//   - -c:v plus the encoder's bitrate/profile/level flags.
-//   - rate-control flags appropriate to the preset's RateControl.
-//   - -fps_mode cfr and -r preset.FPS.Expr() to lock cadence.
-//   - -pix_fmt preset.PixFmt and -g preset.GOP() (or encoder-native
-//     equivalents).
-//   - -force_key_frames for encoders that need it to honor GOP
-//     boundaries reliably (VideoToolbox in particular).
-//
-// What it deliberately does NOT include:
-//
-//   - Audio encoder flags (the supervisor picks aac_at vs libfdk_aac
-//     vs aac based on platform).
-//   - Input flags (-f / -i, capture format, audio device).
-//   - Output muxer flags (HLS segment options, RTMP/SRT URL).
-//
-// Those belong to the supervisor that has the full Config context.
-//
-// FFmpeg docs referenced:
-//
-//   - §5.5  Video Options: -b:v, -r, -pix_fmt, -g, -keyint_min.
-//   - §5.6  Advanced Video: -force_key_frames, hwaccel selection.
-//   - §5.11 Advanced: -fps_mode (replaces -vsync, which is removed),
-//     -copytb behaviour, x264/x265 considerations.
-func BuildFFmpegArgs(p Preset, encoder Encoder) []string {
-	args := make([]string, 0, 48)
-
-	// Color signalling first — before -c:v so hardware encoders bake
-	// the VUI hints into their SPS at init time. See encoder-specific
-	// notes in the supervisor; this ordering matters for VideoToolbox,
-	// NVENC, VAAPI, and QSV alike.
-	args = append(args,
-		"-color_primaries", p.ColorPrimaries,
-		"-color_trc", p.ColorTransfer,
-		"-colorspace", p.ColorSpace,
-		"-color_range", p.ColorRange,
-	)
-
-	args = append(args, encoderArgs(p, encoder)...)
-
-	args = append(args,
-		"-b:v", p.VideoBitrateStr(),
-		"-maxrate", p.VideoMaxBitrateStr(),
-		"-bufsize", p.VideoBufSizeStr(),
-		"-pix_fmt", p.PixFmt,
-		// -fps_mode cfr is the modern replacement for -vsync (which
-		// the FFmpeg docs flag for removal). Without it, the muxer
-		// can fall back to auto and let duplicate-PTS frames through;
-		// that ruins HLS/SRT downstream segment cadence.
-		"-fps_mode", "cfr",
-		// FPS.Expr() emits "30" / "60" for integer rates and
-		// "24000/1001" for NTSC-cinema 23.976. The exact ratio is
-		// load-bearing for cinema cadence over service-length streams.
-		"-r", p.FPS.Expr(),
-	)
-
-	// Audio metadata (sample rate / channels) — the actual -c:a
-	// selection belongs to the supervisor (platform-dependent codec
-	// pick), but the rate envelope is preset-driven.
-	args = append(args,
-		"-b:a", p.AudioBitrateStr(),
-		"-ar", strconv.Itoa(p.AudioSampleRate),
-		"-ac", strconv.Itoa(p.AudioChannels),
-	)
-
-	return args
-}
-
-// encoderArgs returns the -c:v plus encoder-specific rate-control
-// and profile/level flags. Split from BuildFFmpegArgs so callers can
-// inspect the bitrate envelope and the encoder choice independently
-// in tests.
-func encoderArgs(p Preset, encoder Encoder) []string {
-	gop := strconv.Itoa(p.GOP())
-	level := p.Level()
-	levelNoDot := strings.ReplaceAll(level, ".", "")
-	// Two-second IDR cadence — same constant whether we express it
-	// via -force_key_frames (VideoToolbox) or -g/-keyint_min
-	// (everyone else).
-	const keyframeIntervalSec = 2
-
-	switch encoder {
-	case EncoderH264VideoToolbox:
-		// VideoToolbox H.264. -constant_bit_rate gates whether the
-		// rate-control envelope is true CBR (Apple's so-called
-		// "soft CBR" actually undershoots on static scenes by 80%+
-		// when this flag is omitted). -force_key_frames is the only
-		// reliable way to pin GOP boundaries on VideoToolbox; -g
-		// alone is advisory.
-		args := []string{
-			"-c:v", "h264_videotoolbox",
-			"-profile:v", "high",
-			"-level:v", level,
-			"-allow_sw", "1",
-			"-realtime", "1",
-			"-g", gop,
-			"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", keyframeIntervalSec),
-		}
-		if p.RateControl == RateControlCBR {
-			args = append(args, "-constant_bit_rate", "1")
-		}
-		return args
-
-	case EncoderHEVCVideoToolbox:
-		args := []string{
-			"-c:v", "hevc_videotoolbox",
-			"-profile:v", "main10",
-			"-allow_sw", "1",
-			"-realtime", "1",
-			"-g", gop,
-			"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", keyframeIntervalSec),
-			// VideoToolbox HEVC supports tagging the stream as
-			// containing color signalling — without -tag:v hvc1
-			// some Apple decoders refuse HEVC playback.
-			"-tag:v", "hvc1",
-		}
-		if p.RateControl == RateControlCBR {
-			args = append(args, "-constant_bit_rate", "1")
-		}
-		return args
-
-	case EncoderH264NVENC:
-		// NVENC. -rc cbr is true CBR (with -b:v as the target).
-		// no-scenecut + strict_gop produce predictable GOP boundaries
-		// for receivers that key off our cadence.
-		rc := "vbr"
-		if p.RateControl == RateControlCBR {
-			rc = "cbr"
-		}
-		return []string{
-			"-c:v", "h264_nvenc",
-			"-preset", "p5",
-			"-profile:v", "high",
-			"-level:v", level,
-			"-rc", rc,
-			"-no-scenecut", "1",
-			"-forced-idr", "1",
-			"-strict_gop", "1",
-			"-bf", "2",
-			"-g", gop,
-			"-keyint_min", gop,
-		}
-
-	case EncoderHEVCNVENC:
-		rc := "vbr"
-		if p.RateControl == RateControlCBR {
-			rc = "cbr"
-		}
-		return []string{
-			"-c:v", "hevc_nvenc",
-			"-preset", "p5",
-			"-profile:v", "main10",
-			"-rc", rc,
-			"-no-scenecut", "1",
-			"-forced-idr", "1",
-			"-strict_gop", "1",
-			"-bf", "2",
-			"-g", gop,
-			"-keyint_min", gop,
-			"-tag:v", "hvc1",
-		}
-
-	case EncoderH264QSV:
-		// Intel QuickSync. Level uses the dot-less integer form
-		// (QSV's quirk; same in VAAPI).
-		return []string{
-			"-c:v", "h264_qsv",
-			"-preset", "veryfast",
-			"-profile:v", "high",
-			"-level", levelNoDot,
-			"-bf", "2",
-			"-g", gop,
-			"-keyint_min", gop,
-		}
-
-	case EncoderH264VAAPI:
-		// VA-API (Linux Intel/AMD). The renderD device pin lives in
-		// the supervisor — multi-GPU systems expose renderD128 AND
-		// renderD129 and pinning to 128 picks the wrong card.
-		return []string{
-			"-c:v", "h264_vaapi",
-			"-profile:v", "high",
-			"-level", levelNoDot,
-			"-bf", "2",
-			"-g", gop,
-			"-keyint_min", gop,
-		}
-
-	case EncoderX265:
-		// x265 software. -x265-params lets us pin keyint and
-		// scenecut without scattering across CLI args. open-gop=0
-		// keeps every keyframe an IDR (closed GOP) — required for
-		// HLS and broadcast distribution.
-		x265Params := strings.Join([]string{
-			"keyint=" + gop,
-			"min-keyint=" + gop,
-			"scenecut=0",
-			"open-gop=0",
-		}, ":")
-		args := []string{
-			"-c:v", "libx265",
-			"-preset", "medium",
-			"-profile:v", "main10",
-			"-x265-params", x265Params,
-			"-tag:v", "hvc1",
-		}
-		if p.RateControl == RateControlCRF {
-			args = append(args, "-crf", "18")
-		}
-		return args
-
-	default: // libx264 / x264 software fallback
-		// Live H.264 CBR via x264-params:
-		//   nal-hrd=cbr  - declare CBR HRD parameters in the SPS VUI so
-		//                  strict downstream re-muxers don't flag the
-		//                  stream as VBR-with-filler.
-		//   filler=1     - VBV filler NALs maintain hard CBR by padding
-		//                  under-budget frames up to the rate.
-		//   open-gop=0   - closed GOP (every keyframe IDR).
-		//   scenecut=0   - no scene-change keyframes; receivers
-		//                  segment predictably.
-		// No -tune zerolatency: it disables B-frames, which YouTube
-		// recommends keeping (2 B-frames). Broadcast/Cinema both
-		// benefit from B-frames for compression efficiency.
-		x264ParamsList := []string{
-			"keyint=" + gop,
-			"min-keyint=" + gop,
-			"scenecut=0",
-			"open-gop=0",
-		}
-		if p.RateControl == RateControlCBR {
-			x264ParamsList = append([]string{"nal-hrd=cbr", "filler=1"}, x264ParamsList...)
-		}
-		x264Params := strings.Join(x264ParamsList, ":")
-
-		args := []string{
-			"-c:v", "libx264",
-			"-preset", "veryfast",
-			"-profile:v", "high",
-			"-level:v", level,
-			"-sc_threshold", "0",
-			"-bf", "2",
-			"-x264-params", x264Params,
-		}
-		if p.RateControl == RateControlCRF {
-			args = append(args, "-crf", "18")
-		}
-		return args
-	}
 }
 
 // PreferredEncoder picks the first encoder from p.RecommendedHW that

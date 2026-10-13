@@ -114,11 +114,13 @@ func TestArgsUploadHLS(t *testing.T) {
 		"-i /tmp/input.mov",
 		"-pix_fmt yuv420p",
 		"-hls_segment_type mpegts",
-		"append_list",
 		"-hls_list_size 0",
 		"-c:a",
 	)
 	mustNotContain(t, joined,
+		// Upload re-runs are fresh transcodes: appending would
+		// duplicate every segment.
+		"append_list",
 		// Upload conversions should NOT have zerolatency or live-only flags.
 		"-tune zerolatency",
 		"delete_segments",

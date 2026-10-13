@@ -1,9 +1,13 @@
 package atomicfile
 
 import (
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 func TestWriteCreatesFileAndDir(t *testing.T) {
@@ -52,5 +56,25 @@ func TestWriteCleansTempOnSuccess(t *testing.T) {
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 1 || entries[0].Name() != "f" {
 		t.Fatalf("expected only target file, got %v", entries)
+	}
+}
+
+func TestWriteFromFailedReaderLeavesTargetUntouched(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg.ts")
+	if err := os.WriteFile(path, []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r := io.MultiReader(strings.NewReader("partial"), iotest.ErrReader(errors.New("boom")))
+	if err := WriteFrom(path, r, 0644); err == nil {
+		t.Fatal("WriteFrom: expected error from failing reader")
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != "old" {
+		t.Errorf("target = %q, want untouched %q", got, "old")
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Errorf("temp file leaked: %d entries in dir", len(entries))
 	}
 }

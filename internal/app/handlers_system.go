@@ -3,6 +3,7 @@ package app
 import (
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"easycampus/internal/version"
@@ -54,10 +55,15 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	// If EncoderHost is set and not localhost, prefer constructing the URL from it
 	encoderURL := s.settings.DefaultEncoderURL
 	if s.settings.EncoderHost != "" && s.settings.EncoderHost != "localhost" {
-		// Assume standard port 8000 if not specified in host
+		// Encoder and decoder run the same binary; assume the encoder
+		// listens on our configured port unless the host names one.
 		host := s.settings.EncoderHost
 		if !strings.Contains(host, ":") {
-			host = host + ":8000"
+			port := s.settings.Port
+			if port <= 0 {
+				port = 8000
+			}
+			host = host + ":" + strconv.Itoa(port)
 		}
 		// Add protocol if missing
 		if !strings.HasPrefix(host, "http") {

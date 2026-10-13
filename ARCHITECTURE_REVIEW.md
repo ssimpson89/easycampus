@@ -1,3 +1,5 @@
+> **Historical document.** This is the pre-refactor review that motivated the move to the current `cmd/` + `internal/` layout. File names, line numbers and findings refer to the old single-package code and are not kept up to date. Its `livestream-core` extraction was a proposal only and has not happened. For the current code see `README.md` and `ROUTES.md`.
+
 # easycampus-go Architecture Review
 
 Branch: `easystream-alignment`. Reviewer's mandate: written advice only, no code changes. Compare against the sibling project `easystream` (Go 1.25, `cmd/` + `internal/` layout, ~10k lines, 12 test files) and recommend a path forward.

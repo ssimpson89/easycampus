@@ -1,4 +1,7 @@
-media/
+# Runtime data written next to the binary when run from the repo root.
+/media/
+/db.json
+/config.yaml
 # Binary built by `go build` at the repo root. Scoped with a leading
 # slash so it doesn't shadow cmd/easycampus/ (the entry point).
 /easycampus

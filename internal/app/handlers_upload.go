@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"easycampus/internal/atomicfile"
@@ -108,16 +109,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		quality = "high"
 	}
 
-	eventID := time.Now().Format("20060102_150405")
-	eventDir := filepath.Join(s.settings.EventsDir, eventID)
-	_ = os.MkdirAll(eventDir, 0755)
-	filename := header.Filename
-	if filename == "" {
-		filename = "video"
+	eventID, eventDir, err := createEventDir(s.settings.EventsDir)
+	if err != nil {
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+		return
 	}
+	filename := uploadFilename(header.Filename)
 
-	inputPath := filepath.Join(eventDir, filename)
+	inputPath := filepath.Join(eventDir, uploadSourceName(filename))
 	if err := saveMultipartFile(file, inputPath); err != nil {
+		_ = os.RemoveAll(eventDir)
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
 	}
@@ -136,10 +137,11 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	pid, err := s.startUploadConversion(inputPath, eventDir, infoPath, presetForQuality(quality))
 	if err != nil {
 		s.logger.Warn("upload conversion failed", "event_id", eventID, "err", err)
+		updateInfoStatus(infoPath, "failed", 0)
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
 	}
-	updateInfoStatus(infoPath, "processing", pid)
+	recordInfoPID(infoPath, pid)
 
 	s.logger.Info("upload received",
 		"event_id", eventID, "filename", filename, "quality", quality, "pid", pid)
@@ -159,8 +161,8 @@ func (s *Server) handleUploadStatus(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	if eventID == "" {
-		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "Event not found"})
+	if !validID(eventID) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "invalid event id"})
 		return
 	}
 	eventDir := filepath.Join(s.settings.EventsDir, eventID)
@@ -177,19 +179,8 @@ func (s *Server) handleUploadStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if info.Type == "upload" && info.Status == "processing" && info.PID != "" {
-		if pid, err := parsePID(info.PID); err == nil {
-			if !isProcessRunning(pid) {
-				outputFile := filepath.Join(eventDir, "master.m3u8")
-				if _, err := os.Stat(outputFile); err == nil {
-					updateInfoStatus(infoPath, "completed", 0)
-					info.Status = "completed"
-				} else {
-					updateInfoStatus(infoPath, "failed", 0)
-					info.Status = "failed"
-				}
-			}
-		}
+	if info.Type == "upload" {
+		s.reconcileJobStatus(&info, eventDir, infoPath)
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"event_id": eventID, "status": info.Status, "name": info.Name, "type": info.Type, "progress": 0})
@@ -219,16 +210,16 @@ func (s *Server) handleCacheUpload(w http.ResponseWriter, r *http.Request) {
 		quality = "standard"
 	}
 
-	eventID := time.Now().Format("20060102_150405")
-	eventDir := filepath.Join(s.settings.CacheDir, eventID)
-	_ = os.MkdirAll(eventDir, 0755)
-	filename := header.Filename
-	if filename == "" {
-		filename = "video"
+	eventID, eventDir, err := createEventDir(s.settings.CacheDir)
+	if err != nil {
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+		return
 	}
+	filename := uploadFilename(header.Filename)
 
-	inputPath := filepath.Join(eventDir, filename)
+	inputPath := filepath.Join(eventDir, uploadSourceName(filename))
 	if err := saveMultipartFile(file, inputPath); err != nil {
+		_ = os.RemoveAll(eventDir)
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
 	}
@@ -246,10 +237,11 @@ func (s *Server) handleCacheUpload(w http.ResponseWriter, r *http.Request) {
 
 	pid, err := s.startUploadConversion(inputPath, eventDir, infoPath, presetForQuality(quality))
 	if err != nil {
+		updateInfoStatus(infoPath, "failed", 0)
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
 	}
-	updateInfoStatus(infoPath, "processing", pid)
+	recordInfoPID(infoPath, pid)
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "event_id": eventID, "message": fmt.Sprintf("Started processing local file: %s", filename), "status": "processing"})
 }
@@ -263,8 +255,8 @@ func (s *Server) handleCacheUploadStatus(w http.ResponseWriter, r *http.Request)
 	if eventID == "" || eventID == "status" {
 		eventID = pathSegmentAfter(r.URL.Path, "cache")
 	}
-	if eventID == "" {
-		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "Event not found"})
+	if !validID(eventID) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "invalid event id"})
 		return
 	}
 	eventDir := filepath.Join(s.settings.CacheDir, eventID)
@@ -281,19 +273,8 @@ func (s *Server) handleCacheUploadStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if info.Type == "local_upload" && info.Status == "processing" && info.PID != "" {
-		if pid, err := parsePID(info.PID); err == nil {
-			if !isProcessRunning(pid) {
-				outputFile := filepath.Join(eventDir, "master.m3u8")
-				if _, err := os.Stat(outputFile); err == nil {
-					updateInfoStatus(infoPath, "completed", 0)
-					info.Status = "completed"
-				} else {
-					updateInfoStatus(infoPath, "failed", 0)
-					info.Status = "failed"
-				}
-			}
-		}
+	if info.Type == "local_upload" {
+		s.reconcileJobStatus(&info, eventDir, infoPath)
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"event_id": eventID, "status": info.Status, "name": info.Name, "type": info.Type, "progress": 0})
@@ -361,9 +342,8 @@ func (s *Server) createExternalSource(req ExternalSourceRequest) (string, error)
 		req.Framerate = 30
 	}
 
-	eventID := time.Now().Format("20060102_150405")
-	eventDir := filepath.Join(s.settings.EventsDir, eventID)
-	if err := os.MkdirAll(eventDir, 0755); err != nil {
+	eventID, eventDir, err := createEventDir(s.settings.EventsDir)
+	if err != nil {
 		return "", err
 	}
 
@@ -402,7 +382,7 @@ func (s *Server) createExternalSource(req ExternalSourceRequest) (string, error)
 		HWAccel:   ocffmpeg.HWAccelAuto,
 		OutputDir: eventDir,
 	}
-	job, err := ocffmpeg.StartJob(cfg, ocffmpeg.JobOptions{
+	job, err := s.ffmpeg.StartJob(cfg, ocffmpeg.JobOptions{
 		LogPath: filepath.Join(eventDir, "ffmpeg.log"),
 		OnComplete: func(err error) {
 			status := "completed"
@@ -415,9 +395,10 @@ func (s *Server) createExternalSource(req ExternalSourceRequest) (string, error)
 		},
 	})
 	if err != nil {
+		updateInfoStatus(infoPath, "failed", 0)
 		return "", err
 	}
-	updateInfoStatus(infoPath, "processing", job.PID())
+	recordInfoPID(infoPath, job.PID())
 	s.logger.Info("external source job started",
 		"event_id", eventID, "url", req.URL, "pid", job.PID())
 	return eventID, nil
@@ -429,8 +410,8 @@ func (s *Server) handleExternalSourceStatus(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	eventID := pathSegmentAfter(r.URL.Path, "external-sources")
-	if eventID == "" {
-		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "Event not found"})
+	if !validID(eventID) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "invalid event id"})
 		return
 	}
 	eventDir := filepath.Join(s.settings.EventsDir, eventID)
@@ -447,19 +428,8 @@ func (s *Server) handleExternalSourceStatus(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if info.Type == "external" && info.Status == "processing" && info.PID != "" {
-		if pid, err := parsePID(info.PID); err == nil {
-			if !isProcessRunning(pid) {
-				outputFile := filepath.Join(eventDir, "master.m3u8")
-				if _, err := os.Stat(outputFile); err == nil {
-					updateInfoStatus(infoPath, "completed", 0)
-					info.Status = "completed"
-				} else {
-					updateInfoStatus(infoPath, "failed", 0)
-					info.Status = "failed"
-				}
-			}
-		}
+	if info.Type == "external" {
+		s.reconcileJobStatus(&info, eventDir, infoPath)
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"event_id": eventID, "status": info.Status, "name": info.Name, "type": info.Type, "progress": 0})
@@ -480,7 +450,7 @@ func (s *Server) startUploadConversion(inputPath, eventDir, infoPath string, pre
 		HWAccel:   ocffmpeg.HWAccelAuto, // matched decode + encode path where possible
 		OutputDir: eventDir,
 	}
-	job, err := ocffmpeg.StartJob(cfg, ocffmpeg.JobOptions{
+	job, err := s.ffmpeg.StartJob(cfg, ocffmpeg.JobOptions{
 		LogPath: filepath.Join(eventDir, "ffmpeg.log"),
 		OnComplete: func(err error) {
 			status := "completed"
@@ -498,10 +468,88 @@ func (s *Server) startUploadConversion(inputPath, eventDir, infoPath string, pre
 	return job.PID(), nil
 }
 
+// reconcileJobStatus resolves a "processing" job whose completion
+// callback never ran (e.g. the daemon restarted mid-conversion). Jobs
+// tracked by this process are trusted; otherwise fall back to a PID
+// liveness probe.
+func (s *Server) reconcileJobStatus(info *EventInfoFile, eventDir, infoPath string) {
+	if info.Status != "processing" || info.PID == "" {
+		return
+	}
+	pid, err := parsePID(info.PID)
+	if err != nil || s.ffmpeg.JobRunning(pid) || isProcessRunning(pid) {
+		return
+	}
+	status := "failed"
+	if _, err := os.Stat(filepath.Join(eventDir, "master.m3u8")); err == nil {
+		status = "completed"
+	}
+	updateInfoStatus(infoPath, status, 0)
+	info.Status = status
+}
+
+// infoMu serializes read-modify-write cycles on info.json files. Job
+// completion callbacks run on their own goroutines and race the
+// handler that records the PID; without this a fast-failing job's
+// "failed" could be overwritten back to "processing".
+var infoMu sync.Mutex
+
+// recordInfoPID stores pid in info.json, but only while the job is still
+// "processing" — if the completion callback already ran, leave it alone.
+func recordInfoPID(infoPath string, pid int) {
+	infoMu.Lock()
+	defer infoMu.Unlock()
+	data, err := os.ReadFile(infoPath)
+	if err != nil {
+		return
+	}
+	var info map[string]interface{}
+	if err := json.Unmarshal(data, &info); err != nil {
+		return
+	}
+	if st, _ := info["status"].(string); st != "processing" {
+		return
+	}
+	info["pid"] = fmt.Sprintf("%d", pid)
+	updated, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = atomicfile.Write(infoPath, updated, 0644)
+}
+
+// uploadSourceName is the on-disk name for an uploaded source file. It
+// is generated rather than client-chosen so an upload can never collide
+// with files the pipeline writes into the same directory (info.json,
+// ffmpeg.log, master.m3u8, init/segment files). Only a short
+// alphanumeric extension is kept so FFmpeg can still probe by suffix;
+// the original filename is kept as metadata in info.json.
+func uploadSourceName(original string) string {
+	ext := strings.TrimPrefix(filepath.Ext(original), ".")
+	if ext == "" || len(ext) > 8 || strings.IndexFunc(ext, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9')
+	}) >= 0 {
+		return "source.upload"
+	}
+	return "source." + strings.ToLower(ext)
+}
+
+// uploadFilename reduces a client-supplied multipart filename to a safe
+// single path component.
+func uploadFilename(name string) string {
+	name = filepath.Base(strings.ReplaceAll(name, `\`, "/"))
+	if name == "" || name == "." || name == ".." || name == "/" || name == "info.json" {
+		return "video"
+	}
+	return name
+}
+
 // updateInfoStatus rewrites info.json's status/pid fields atomically.
 // Atomic so a crash mid-write cannot leave a truncated file that
 // listEvents silently drops.
 func updateInfoStatus(infoPath, status string, pid int) {
+	infoMu.Lock()
+	defer infoMu.Unlock()
 	data, err := os.ReadFile(infoPath)
 	if err != nil {
 		return
@@ -514,7 +562,7 @@ func updateInfoStatus(infoPath, status string, pid int) {
 	if pid > 0 {
 		info["pid"] = fmt.Sprintf("%d", pid)
 	}
-	if status == "completed" || status == "failed" {
+	if status == "completed" || status == "failed" || status == "stopped" {
 		info["stopped_at"] = time.Now().Format(time.RFC3339)
 		delete(info, "pid")
 	}

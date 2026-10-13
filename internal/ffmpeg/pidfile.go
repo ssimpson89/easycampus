@@ -145,8 +145,12 @@ func isFFmpegCommandLine(line string) bool {
 		line = line[:idx]
 	}
 	base := line
-	if idx := strings.LastIndex(line, "/"); idx >= 0 {
+	if idx := strings.LastIndexAny(line, "/\\"); idx >= 0 {
 		base = line[idx+1:]
+	}
+	// Windows images are "ffmpeg.exe" (any case).
+	if len(base) > 4 && strings.EqualFold(base[len(base)-4:], ".exe") {
+		base = base[:len(base)-4]
 	}
 	return strings.EqualFold(base, "ffmpeg")
 }

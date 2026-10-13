@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"easycampus/internal/atomicfile"
@@ -39,9 +41,31 @@ func writeBookmarks(settings AppSettings, eventID string, bookmarks []Bookmark) 
 	return atomicfile.Write(bookmarksPath, data, 0644)
 }
 
+var (
+	errInvalidBookmarkID = errors.New("invalid bookmark id")
+	errBookmarkExists    = errors.New("bookmark id already exists")
+)
+
+// nextBookmarkID returns "bm_NNN" one past the highest numeric suffix in
+// use. Unlike len+1 this never re-issues an ID after a delete.
+func nextBookmarkID(bookmarks []Bookmark) string {
+	maxN := 0
+	for _, bm := range bookmarks {
+		if rest, ok := strings.CutPrefix(bm.ID, "bm_"); ok {
+			if n, err := strconv.Atoi(rest); err == nil && n > maxN {
+				maxN = n
+			}
+		}
+	}
+	return "bm_" + padInt(maxN+1, 3)
+}
+
 // createBookmark appends a bookmark constructed from the typed request.
 // Empty Name falls back to "Unnamed Bookmark"; FPS defaults to 30 to
 // match the legacy UI behavior when the client omits the field.
+//
+// Callers must serialize calls per event (Server.bookmarkLocks); this
+// is a read-modify-write of bookmarks.json.
 func createBookmark(settings AppSettings, eventID string, req BookmarkCreateRequest) (Bookmark, error) {
 	bookmarks, err := readBookmarks(settings, eventID)
 	if err != nil {
@@ -57,8 +81,21 @@ func createBookmark(settings AppSettings, eventID string, req BookmarkCreateRequ
 		fps = 30.0
 	}
 
+	id := nextBookmarkID(bookmarks)
+	if req.ID != "" {
+		if !validID(req.ID) {
+			return Bookmark{}, errInvalidBookmarkID
+		}
+		for _, bm := range bookmarks {
+			if bm.ID == req.ID {
+				return Bookmark{}, errBookmarkExists
+			}
+		}
+		id = req.ID
+	}
+
 	bookmark := Bookmark{
-		ID:        "bm_" + padInt(len(bookmarks)+1, 3),
+		ID:        id,
 		Name:      name,
 		Frame:     req.Frame,
 		FPS:       fps,
@@ -113,19 +150,20 @@ func deleteBookmark(settings AppSettings, eventID, bookmarkID string) (bool, err
 		return false, err
 	}
 
-	next := bookmarks[:0]
-	removed := false
-	for _, bm := range bookmarks {
+	// Remove only the first match: legacy files written by the old
+	// len+1 allocator can contain duplicate IDs, and a delete must not
+	// silently take out an unrelated bookmark that shares the ID.
+	idx := -1
+	for i, bm := range bookmarks {
 		if bm.ID == bookmarkID {
-			removed = true
-			continue
+			idx = i
+			break
 		}
-		next = append(next, bm)
 	}
-
-	if !removed {
+	if idx < 0 {
 		return false, nil
 	}
+	next := append(bookmarks[:idx:idx], bookmarks[idx+1:]...)
 
 	if err := writeBookmarks(settings, eventID, next); err != nil {
 		return false, err

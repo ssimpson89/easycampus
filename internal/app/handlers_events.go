@@ -1,10 +1,14 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"strings"
+	"time"
 )
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -26,11 +30,29 @@ func (s *Server) handleEventDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	eventID := pathSegmentAfter(r.URL.Path, "events")
-	if eventID == "" {
-		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "missing event id"})
+	if !validID(eventID) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "invalid event id"})
 		return
 	}
-	if err := deleteEvent(s.settings, eventID); err != nil {
+	if s.ffmpeg.IsRunning() && s.ffmpeg.CurrentEventID() == eventID {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"detail": "event is currently live; stop the stream first"})
+		return
+	}
+	// Only PIDs of jobs this process launched are killed; a PID read
+	// from info.json may belong to an unrelated process after a restart.
+	// Wait (bounded) for a cancelled job to exit before its directory is
+	// removed, so FFmpeg isn't writing into an unlinked dir and Windows
+	// doesn't refuse to delete files it still holds open.
+	err := deleteEvent(s.settings, eventID, func(pid int) {
+		waitCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		s.ffmpeg.CancelJobAndWait(waitCtx, pid)
+	})
+	if errors.Is(err, fs.ErrNotExist) {
+		s.writeJSON(w, http.StatusNotFound, map[string]string{"detail": "Event not found"})
+		return
+	}
+	if err != nil {
 		s.logger.Warn("event delete failed", "event_id", eventID, "err", err)
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 		return
@@ -51,6 +73,10 @@ func (s *Server) handleEventBookmarks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	eventID := parts[0]
+	if !validID(eventID) || (len(parts) == 3 && !validID(parts[2])) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "invalid id"})
+		return
+	}
 
 	if len(parts) == 2 {
 		switch r.Method {
@@ -68,7 +94,17 @@ func (s *Server) handleEventBookmarks(w http.ResponseWriter, r *http.Request) {
 				s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": err.Error()})
 				return
 			}
+			unlock := s.bookmarkLocks.lock(eventID)
 			bookmark, err := createBookmark(s.settings, eventID, req)
+			unlock()
+			if errors.Is(err, errInvalidBookmarkID) {
+				s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": err.Error()})
+				return
+			}
+			if errors.Is(err, errBookmarkExists) {
+				s.writeJSON(w, http.StatusConflict, map[string]string{"detail": err.Error()})
+				return
+			}
 			if err != nil {
 				s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 				return
@@ -90,14 +126,18 @@ func (s *Server) handleEventBookmarks(w http.ResponseWriter, r *http.Request) {
 				s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": err.Error()})
 				return
 			}
+			unlock := s.bookmarkLocks.lock(eventID)
 			bookmark, err := updateBookmark(s.settings, eventID, bookmarkID, req)
+			unlock()
 			if err != nil {
 				s.writeJSON(w, http.StatusNotFound, map[string]string{"detail": "Bookmark not found"})
 				return
 			}
 			s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "bookmark": bookmark})
 		case http.MethodDelete:
+			unlock := s.bookmarkLocks.lock(eventID)
 			removed, err := deleteBookmark(s.settings, eventID, bookmarkID)
+			unlock()
 			if err != nil {
 				s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
 				return

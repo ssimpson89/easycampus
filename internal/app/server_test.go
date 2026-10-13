@@ -58,6 +58,7 @@ func pickFreePort(t *testing.T) int {
 // sequence (cache.StopAll / ffmpeg.StopStream / mpv.Stop order).
 func TestServerStartsAndStops(t *testing.T) {
 	srv, baseURL := testServer(t)
+	client := noKeepAliveClient()
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -78,7 +79,7 @@ func TestServerStartsAndStops(t *testing.T) {
 	}
 
 	// Hit /health and assert the JSON shape.
-	resp, err := http.Get(baseURL + "/health")
+	resp, err := client.Get(baseURL + "/health")
 	if err != nil {
 		t.Fatalf("GET /health: %v", err)
 	}
@@ -115,7 +116,7 @@ func TestServerStartsAndStops(t *testing.T) {
 	}
 
 	// After shutdown the listener should be gone; a follow-up GET fails.
-	if _, err := http.Get(baseURL + "/health"); err == nil {
+	if _, err := client.Get(baseURL + "/health"); err == nil {
 		t.Errorf("GET /health after shutdown succeeded; expected connection refused")
 	}
 }
@@ -211,12 +212,13 @@ func TestAPIRouteMirror(t *testing.T) {
 		t.Fatalf("server never became reachable")
 	}
 
+	client := noKeepAliveClient()
 	for _, path := range []string{
 		"/health", "/api/health",
 		"/status", "/api/status",
 		"/config", "/api/config",
 	} {
-		resp, err := http.Get(baseURL + path)
+		resp, err := client.Get(baseURL + path)
 		if err != nil {
 			t.Errorf("GET %s: %v", path, err)
 			continue
@@ -228,14 +230,27 @@ func TestAPIRouteMirror(t *testing.T) {
 	}
 }
 
+// noKeepAliveClient returns a client that never pools connections. The
+// lifecycle tests use it so no idle keep-alive connection is left open
+// when the server shuts down (http.Server.Shutdown waits on fresh idle
+// conns, which used to make TestServerStartsAndStops flaky).
+func noKeepAliveClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{DisableKeepAlives: true},
+		Timeout:   5 * time.Second,
+	}
+}
+
 // waitForListen polls url until it returns any HTTP response or the
 // timeout expires. Used by the lifecycle tests to avoid sleeping on a
 // fixed schedule.
 func waitForListen(t *testing.T, url string, timeout time.Duration) bool {
 	t.Helper()
+	client := noKeepAliveClient()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if resp, err := http.Get(url); err == nil {
+		if resp, err := client.Get(url); err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			return true
 		}

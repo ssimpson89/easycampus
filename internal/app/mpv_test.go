@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"easycampus/internal/playback"
 )
 
 // shortTempSocketPath returns a path short enough for AF_UNIX (108
@@ -51,21 +54,11 @@ func TestWaitForMPVSocketSucceedsImmediately(t *testing.T) {
 	}
 	defer listener.Close()
 
-	// Need a non-nil *exec.Cmd to pass through the poll loop's
-	// ProcessState check. A "sleep 10" is the cheapest portable way
-	// to get a started-but-still-running child without depending on
-	// mpv being installed in the test environment.
-	cmd := exec.Command("sleep", "10")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start sleep: %v", err)
-	}
-	defer func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	}()
+	// An open "exited" channel stands in for a still-running child.
+	exited := make(chan struct{})
 
 	start := time.Now()
-	if err := waitForMPVSocket(context.Background(), cmd, socketPath, 5*time.Second); err != nil {
+	if err := waitForMPVSocket(context.Background(), exited, socketPath, 5*time.Second); err != nil {
 		t.Fatalf("waitForMPVSocket: %v", err)
 	}
 	elapsed := time.Since(start)
@@ -80,17 +73,10 @@ func TestWaitForMPVSocketSucceedsImmediately(t *testing.T) {
 func TestWaitForMPVSocketTimesOut(t *testing.T) {
 	socketPath := shortTempSocketPath(t, "never.sock")
 
-	cmd := exec.Command("sleep", "10")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start sleep: %v", err)
-	}
-	defer func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	}()
+	exited := make(chan struct{}) // child still "running"
 
 	start := time.Now()
-	err := waitForMPVSocket(context.Background(), cmd, socketPath, 200*time.Millisecond)
+	err := waitForMPVSocket(context.Background(), exited, socketPath, 200*time.Millisecond)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatalf("waitForMPVSocket: expected timeout error, got nil")
@@ -117,15 +103,15 @@ func TestWaitForMPVSocketTimesOut(t *testing.T) {
 func TestWaitForMPVSocketDetectsChildExit(t *testing.T) {
 	socketPath := shortTempSocketPath(t, "never.sock")
 
-	// `true` exits immediately with status 0.
+	// `true` exits immediately; the reaper closes done once Wait returns.
 	cmd := exec.Command("true")
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("run true: %v", err)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start true: %v", err)
 	}
-	// After Run() the ProcessState is set; waitForMPVSocket should
-	// observe that on its first iteration and return promptly.
+	proc := startReaper(cmd)
+	<-proc.done
 	start := time.Now()
-	err := waitForMPVSocket(context.Background(), cmd, socketPath, 5*time.Second)
+	err := waitForMPVSocket(context.Background(), proc.done, socketPath, 5*time.Second)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatalf("waitForMPVSocket: expected exited-process error, got nil")
@@ -187,24 +173,21 @@ func TestSendIPCHonoursContextDeadline(t *testing.T) {
 	}()
 
 	// Build a minimal MPVService pointed at the fake socket. We bypass
-	// Start by injecting a fake "process" that signal-0 reports as
-	// alive — IsRunning short-circuits the IPC otherwise.
+	// Start by injecting a live child process — IsRunning short-circuits
+	// the IPC otherwise.
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := &MPVService{
 		socketPath: socketPath,
 		logger:     logger,
 	}
-	// Use `sleep 30` so signal-0 in IsRunning returns nil for the
-	// duration of the test.
+	// Use `sleep 30` so IsRunning reports alive for the duration of
+	// the test; the reaper owns Wait.
 	cmd := exec.Command("sleep", "30")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start sleep: %v", err)
 	}
-	defer func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	}()
-	svc.process = cmd
+	svc.proc = startReaper(cmd)
+	defer svc.proc.kill()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -221,5 +204,74 @@ func TestSendIPCHonoursContextDeadline(t *testing.T) {
 	// through instead of the prior 3s read deadline ruling the wait.
 	if elapsed > 200*time.Millisecond {
 		t.Errorf("sendIPC took %s; want <200ms (ctx deadline 50ms)", elapsed)
+	}
+}
+
+// TestMPVIsRunningReflectsChildExit pins the zombie fix: once the child
+// exits on its own, the reaper observes it and IsRunning flips to false
+// (previously a never-Waited child stayed a zombie that signal-0 still
+// reported as alive).
+func TestMPVIsRunningReflectsChildExit(t *testing.T) {
+	cmd := exec.Command("sleep", "0.1")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
+	}
+	svc := &MPVService{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	svc.proc = startReaper(cmd)
+	if !svc.IsRunning(context.Background()) {
+		t.Fatal("IsRunning = false right after start, want true")
+	}
+	select {
+	case <-svc.proc.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reaper never observed child exit")
+	}
+	if svc.IsRunning(context.Background()) {
+		t.Error("IsRunning = true after child exited, want false")
+	}
+	if svc.Status(context.Background()).IsRunning {
+		t.Error("Status().IsRunning = true after child exited, want false")
+	}
+	// Stop on an already-exited child must not block.
+	_ = svc.Stop(context.Background())
+}
+
+func TestMPVValidatePlaybackURL(t *testing.T) {
+	cache := t.TempDir()
+	events := t.TempDir()
+	svc := NewMPVService(AppSettings{CacheDir: cache, EventsDir: events}, nil)
+
+	good := []string{
+		"http://encoder.local:8000/events/abc/master.m3u8",
+		"https://example.com/x.m3u8",
+		filepath.Join(cache, "evt", "master.m3u8"),
+		filepath.Join(events, "evt", "master.m3u8"),
+	}
+	for _, u := range good {
+		if err := svc.validatePlaybackURL(u); err != nil {
+			t.Errorf("validatePlaybackURL(%q) = %v, want nil", u, err)
+		}
+	}
+	bad := []string{
+		"",
+		"--script=/tmp/evil.lua",
+		"-v",
+		"file:///etc/passwd",
+		"av://lavfi:testsrc",
+		"ytdl://something",
+		"relative/master.m3u8",
+		"/etc/passwd",
+		filepath.Join(cache, "..", "outside.m3u8"),
+		cache,
+		"http://",
+	}
+	for _, u := range bad {
+		if err := svc.validatePlaybackURL(u); err == nil {
+			t.Errorf("validatePlaybackURL(%q) = nil, want error", u)
+		}
+	}
+	// Start must refuse before spawning anything.
+	if err := svc.Start(context.Background(), "--script=x.lua", 0, playback.Default(), false); !errors.Is(err, errInvalidPlaybackURL) {
+		t.Errorf("Start with option-shaped URL: err=%v, want errInvalidPlaybackURL", err)
 	}
 }

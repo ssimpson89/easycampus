@@ -252,6 +252,9 @@ func (a *AdaptiveController) tick() {
 	}
 	a.mu.Unlock()
 
+	// Capture the stream generation before deciding, so a transition
+	// computed against this stream can't land on a later one.
+	gen := a.sup.Generation()
 	status := a.sup.Status()
 	if status.State != StateRunning && status.State != StateDegraded && status.State != StateRestarting {
 		return
@@ -275,10 +278,10 @@ func (a *AdaptiveController) tick() {
 		case slow:
 			reason = "Encoder falling behind real-time (upload bandwidth limited)"
 		}
-		a.handleDegradation(reason)
+		a.handleDegradation(reason, gen)
 		return
 	}
-	a.maybeRecover()
+	a.maybeRecover(gen)
 }
 
 func (a *AdaptiveController) sampleProgress(p Progress) {
@@ -371,7 +374,7 @@ func (a *AdaptiveController) hasRestartStorm() bool {
 	return count >= a.cfg.RestartRateMax
 }
 
-func (a *AdaptiveController) handleDegradation(reason string) {
+func (a *AdaptiveController) handleDegradation(reason string, gen uint64) {
 	a.mu.Lock()
 	if !a.lastTransitionAt.IsZero() && time.Since(a.lastTransitionAt) < a.cfg.DowngradeCooldown {
 		a.mu.Unlock()
@@ -390,12 +393,12 @@ func (a *AdaptiveController) handleDegradation(reason string) {
 		return
 	}
 	a.logger.Printf("adaptive: degradation detected (%s). Stepping down %s -> %s", reason, current, next.ID())
-	if err := a.transitionTo(next, reason, true); err != nil {
+	if err := a.transitionTo(next, reason, true, gen); err != nil {
 		a.logger.Printf("adaptive: failed to step down: %v", err)
 	}
 }
 
-func (a *AdaptiveController) maybeRecover() {
+func (a *AdaptiveController) maybeRecover(gen uint64) {
 	a.mu.Lock()
 	if a.currentPreset == a.targetPreset {
 		a.mu.Unlock()
@@ -415,17 +418,18 @@ func (a *AdaptiveController) maybeRecover() {
 		return
 	}
 	a.logger.Printf("adaptive: stable for %s. Stepping back up %s -> %s", a.cfg.StableForRecovery, current, next.ID())
-	if err := a.transitionTo(next, "stable conditions — restoring quality", false); err != nil {
+	if err := a.transitionTo(next, "stable conditions — restoring quality", false, gen); err != nil {
 		a.logger.Printf("adaptive: failed to step up: %v", err)
 	}
 }
 
-func (a *AdaptiveController) transitionTo(preset QualityPreset, reason string, isDowngrade bool) error {
-	cfg := a.sup.CurrentConfig()
-	eventID := cfg.OutputDir // adaptive only runs on live encode; use a stable identifier
-	cfg.Preset = preset
-	a.sup.Stop()
-	if err := a.sup.Start(cfg, eventID); err != nil {
+// transitionTo swaps the running stream onto `preset`. It goes through
+// Supervisor.SwapPresetIfGeneration (config update + in-place restart
+// under the supervisor lock) rather than Stop+Start, so it can't
+// resurrect a stream the operator just stopped, keeps the real event ID,
+// and the restart appends to the live playlist instead of wiping it.
+func (a *AdaptiveController) transitionTo(preset QualityPreset, reason string, isDowngrade bool, gen uint64) error {
+	if err := a.sup.SwapPresetIfGeneration(preset, "adaptive: "+reason, gen); err != nil {
 		return err
 	}
 	a.mu.Lock()

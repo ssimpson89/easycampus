@@ -12,9 +12,14 @@ builds:
     binary: easycampus
     env:
       - CGO_ENABLED=0
-    # macOS + Linux only. Windows is excluded until the architect's
-    # mpv.go Windows liveness probe TODO is closed and we have a real
-    # smoke test on a Windows host.
+    # Strip local filesystem paths from the binary and pin its mtime to
+    # the commit timestamp (steps toward reproducible archives).
+    flags:
+      - -trimpath
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    # Windows is not supported for now. Among other gaps, the decoder's
+    # mpv control uses a unix socket, and mpv on Windows only speaks
+    # named pipes, so projector output can't work there.
     goos:
       - darwin
       - linux

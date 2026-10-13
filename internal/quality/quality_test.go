@@ -255,140 +255,6 @@ func TestRecommendNoBandwidthMatch(t *testing.T) {
 	}
 }
 
-// TestBuildFFmpegArgsCarriesColorSignaling verifies every encoder
-// path emits the color metadata BEFORE -c:v. Hardware encoders bake
-// the VUI hints into the SPS at init.
-func TestBuildFFmpegArgsCarriesColorSignaling(t *testing.T) {
-	p, _ := ByID("broadcast-1080p30")
-	encoders := []Encoder{
-		EncoderX264, EncoderH264VideoToolbox, EncoderH264NVENC,
-		EncoderH264QSV, EncoderH264VAAPI,
-	}
-	for _, enc := range encoders {
-		args := BuildFFmpegArgs(p, enc)
-		// Color flags must appear before -c:v.
-		colorIdx := indexOf(args, "-color_primaries")
-		cvIdx := indexOf(args, "-c:v")
-		if colorIdx < 0 || cvIdx < 0 {
-			t.Errorf("encoder %q: missing -color_primaries (%d) or -c:v (%d)",
-				enc, colorIdx, cvIdx)
-			continue
-		}
-		if colorIdx > cvIdx {
-			t.Errorf("encoder %q: -color_primaries (idx %d) must come before -c:v (idx %d)",
-				enc, colorIdx, cvIdx)
-		}
-	}
-}
-
-// TestBuildFFmpegArgsHEVCPresets verifies the HEVC encoder paths
-// emit hvc1 tagging — Apple decoders refuse HEVC without it.
-func TestBuildFFmpegArgsHEVCPresets(t *testing.T) {
-	p, _ := ByID("broadcast-2160p30")
-	for _, enc := range []Encoder{EncoderHEVCNVENC, EncoderHEVCVideoToolbox, EncoderX265} {
-		args := BuildFFmpegArgs(p, enc)
-		if !contains(args, "-tag:v") || !contains(args, "hvc1") {
-			t.Errorf("encoder %q HEVC args missing -tag:v hvc1: %v", enc, args)
-		}
-	}
-}
-
-// TestBuildFFmpegArgsCBRBroadcast verifies broadcast x264 path emits
-// the SPS HRD parameters (nal-hrd=cbr) so strict CDNs treat the
-// stream as CBR, not VBR-with-filler.
-func TestBuildFFmpegArgsCBRBroadcast(t *testing.T) {
-	p, _ := ByID("broadcast-1080p30")
-	args := BuildFFmpegArgs(p, EncoderX264)
-	idx := indexOf(args, "-x264-params")
-	if idx < 0 || idx+1 >= len(args) {
-		t.Fatal("broadcast x264 args missing -x264-params")
-	}
-	params := args[idx+1]
-	if !strings.Contains(params, "nal-hrd=cbr") {
-		t.Errorf("broadcast x264 -x264-params=%q missing nal-hrd=cbr", params)
-	}
-	if !strings.Contains(params, "filler=1") {
-		t.Errorf("broadcast x264 -x264-params=%q missing filler=1", params)
-	}
-	if !strings.Contains(params, "scenecut=0") {
-		t.Errorf("broadcast x264 -x264-params=%q missing scenecut=0", params)
-	}
-}
-
-// TestBuildFFmpegArgsConsumerVBR verifies consumer presets DON'T
-// declare HRD CBR — those defaults exclude SPS filler NALs which
-// VBR streams shouldn't carry.
-func TestBuildFFmpegArgsConsumerVBR(t *testing.T) {
-	p, _ := ByID("consumer-1080p30")
-	args := BuildFFmpegArgs(p, EncoderX264)
-	idx := indexOf(args, "-x264-params")
-	if idx < 0 || idx+1 >= len(args) {
-		t.Fatal("consumer x264 args missing -x264-params")
-	}
-	params := args[idx+1]
-	if strings.Contains(params, "nal-hrd=cbr") {
-		t.Errorf("consumer x264 -x264-params=%q should NOT declare nal-hrd=cbr (VBR preset)", params)
-	}
-}
-
-// TestBuildFFmpegArgsCadenceFlags verifies fps_mode + -r emit
-// together so the muxer locks both the rate and CFR semantics.
-// -r without fps_mode lets duplicate-PTS frames through.
-func TestBuildFFmpegArgsCadenceFlags(t *testing.T) {
-	for _, id := range []string{"consumer-1080p30", "cinema-1080p2398", "broadcast-1080p60"} {
-		p, ok := ByID(id)
-		if !ok {
-			t.Fatalf("missing preset %q", id)
-		}
-		args := BuildFFmpegArgs(p, EncoderX264)
-		fpsModeIdx := indexOf(args, "-fps_mode")
-		rIdx := indexOf(args, "-r")
-		if fpsModeIdx < 0 || rIdx < 0 {
-			t.Errorf("preset %q missing -fps_mode (%d) or -r (%d)", id, fpsModeIdx, rIdx)
-			continue
-		}
-		if args[fpsModeIdx+1] != "cfr" {
-			t.Errorf("preset %q -fps_mode=%q, want cfr", id, args[fpsModeIdx+1])
-		}
-		// Cinema 23.976 must emit "24000/1001"; integer rates must
-		// emit a plain decimal.
-		gotR := args[rIdx+1]
-		wantR := p.FPS.Expr()
-		if gotR != wantR {
-			t.Errorf("preset %q -r=%q, want %q", id, gotR, wantR)
-		}
-	}
-}
-
-// TestBuildFFmpegArgsVideoToolboxKeyframeExpr verifies VideoToolbox
-// uses -force_key_frames for IDR cadence. -g alone is advisory on
-// VideoToolbox — confirmed by Apple's WWDC sessions.
-func TestBuildFFmpegArgsVideoToolboxKeyframeExpr(t *testing.T) {
-	p, _ := ByID("broadcast-1080p30")
-	args := BuildFFmpegArgs(p, EncoderH264VideoToolbox)
-	idx := indexOf(args, "-force_key_frames")
-	if idx < 0 {
-		t.Fatal("VideoToolbox args missing -force_key_frames")
-	}
-	expr := args[idx+1]
-	if !strings.HasPrefix(expr, "expr:") {
-		t.Errorf("VideoToolbox -force_key_frames=%q should start with expr:", expr)
-	}
-}
-
-// TestBuildFFmpegArgsNVENCStrictGOP verifies NVENC paths emit
-// -strict_gop and -no-scenecut so receivers can count frames to
-// the next IDR.
-func TestBuildFFmpegArgsNVENCStrictGOP(t *testing.T) {
-	p, _ := ByID("broadcast-1080p30")
-	args := BuildFFmpegArgs(p, EncoderH264NVENC)
-	for _, want := range []string{"-strict_gop", "-no-scenecut", "-forced-idr"} {
-		if !contains(args, want) {
-			t.Errorf("NVENC args missing %s: %v", want, args)
-		}
-	}
-}
-
 // TestPreferredEncoderFallback verifies the encoder selector falls
 // back to the right software encoder when no hardware option fits.
 func TestPreferredEncoderFallback(t *testing.T) {
@@ -412,10 +278,11 @@ func TestPreferredEncoderFallback(t *testing.T) {
 // gate the catalog — undercounting strands operators on a preset
 // they can't actually stream.
 func TestPresetMinUploadIncludesAudio(t *testing.T) {
+	// Documented contract: video + audio + 20% protocol overhead.
 	for _, p := range Presets {
-		floor := p.VideoBitrate + p.AudioBitrate
+		floor := ((p.VideoBitrate+p.AudioBitrate)*12 + 9) / 10 // ceil(x*1.2)
 		if p.MinUploadKbps < floor {
-			t.Errorf("preset %q MinUploadKbps=%d < video+audio=%d — must include audio overhead",
+			t.Errorf("preset %q MinUploadKbps=%d < (video+audio)*1.2=%d",
 				p.ID, p.MinUploadKbps, floor)
 		}
 	}

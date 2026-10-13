@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"easycampus/internal/playback"
@@ -29,8 +30,16 @@ func (s *Server) handleOutputStart(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": err.Error()})
 		return
 	}
-	if req.ScreenIndex == 0 {
-		req.ScreenIndex = 1
+	// Displays are 0-based; only default when the client omitted the
+	// field. The default stays 1 (the secondary / projector display)
+	// to preserve legacy behaviour for clients that never sent it.
+	screenIndex := 1
+	if req.ScreenIndex != nil {
+		if *req.ScreenIndex < 0 {
+			s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "screen_index must be >= 0"})
+			return
+		}
+		screenIndex = *req.ScreenIndex
 	}
 	if req.OutputMode == "" {
 		req.OutputMode = "display"
@@ -38,14 +47,23 @@ func (s *Server) handleOutputStart(w http.ResponseWriter, r *http.Request) {
 	if req.DecklinkFormat == "" {
 		req.DecklinkFormat = "720p59.94"
 	}
-	// MPV is a foreground decoder — the request ctx scopes startup
-	// (process spawn + IPC socket wait). Cancellation kills the child
-	// promptly, which is what we want: if the operator hits Cancel in
-	// the UI we shouldn't leave a half-started mpv around.
+	// The request ctx bounds only startup (stopping any previous mpv
+	// and waiting for the IPC socket). If the client disconnects during
+	// that window mpv.Start kills the half-started child; once it's up,
+	// mpv runs until /output/stop regardless of this request.
 	profile := s.resolvePlaybackProfile(req.PlaybackProfile, req.OutputMode, req.DecklinkFormat)
-	if err := s.mpv.Start(r.Context(), req.URL, req.ScreenIndex, profile, req.Fullscreen); err != nil {
+	if err := profile.CheckAvailable(); err != nil {
+		s.logger.Warn("output start refused: profile unavailable", "profile", profile.ID, "err", err)
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": err.Error()})
+		return
+	}
+	if err := s.mpv.Start(r.Context(), req.URL, screenIndex, profile, req.Fullscreen); err != nil {
 		s.logger.Warn("output start failed", "url", req.URL, "err", err)
-		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+		status := http.StatusInternalServerError
+		if errors.Is(err, errInvalidPlaybackURL) {
+			status = http.StatusBadRequest
+		}
+		s.writeJSON(w, status, map[string]string{"detail": err.Error()})
 		return
 	}
 	// Persist the operator's last choice in-memory so subsequent
@@ -53,7 +71,7 @@ func (s *Server) handleOutputStart(w http.ResponseWriter, r *http.Request) {
 	// it (until the daemon restarts; durable persistence is the YAML
 	// playback_profile field).
 	if req.PlaybackProfile != "" {
-		s.settings.PlaybackProfile = req.PlaybackProfile
+		s.setPlaybackProfile(req.PlaybackProfile)
 	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":          true,
@@ -80,7 +98,7 @@ func (s *Server) handleOutputStart(w http.ResponseWriter, r *http.Request) {
 func (s *Server) resolvePlaybackProfile(requested, outputMode, decklinkFormat string) playback.Profile {
 	id := requested
 	if id == "" {
-		id = s.settings.PlaybackProfile
+		id = s.currentPlaybackProfile()
 	}
 	if id == "" {
 		if outputMode == "decklink" {
@@ -145,7 +163,11 @@ func (s *Server) handleOutputUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.mpv.Load(ctx, req.URL); err != nil {
-		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+		status := http.StatusInternalServerError
+		if errors.Is(err, errInvalidPlaybackURL) {
+			status = http.StatusBadRequest
+		}
+		s.writeJSON(w, status, map[string]string{"detail": err.Error()})
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Updated output stream"})
@@ -165,23 +187,28 @@ func (s *Server) handleOutputSync(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	s.logger.Info("output sync",
 		"command", req.Command, "timestamp", req.Timestamp)
+	var err error
 	switch req.Command {
 	case "play":
-		_ = s.mpv.Play(ctx)
-		if req.Timestamp > 0 {
-			_ = s.mpv.Seek(ctx, req.Timestamp)
+		err = s.mpv.Play(ctx)
+		if err == nil && req.Timestamp > 0 {
+			err = s.mpv.Seek(ctx, req.Timestamp)
 		}
 	case "pause":
-		_ = s.mpv.Pause(ctx)
-		if req.Timestamp > 0 {
-			_ = s.mpv.Seek(ctx, req.Timestamp)
+		err = s.mpv.Pause(ctx)
+		if err == nil && req.Timestamp > 0 {
+			err = s.mpv.Seek(ctx, req.Timestamp)
 		}
 	case "seek":
-		if err := s.mpv.Seek(ctx, req.Timestamp); err != nil {
-			s.logger.Warn("output seek failed", "timestamp", req.Timestamp, "err", err)
-			s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
-			return
-		}
+		err = s.mpv.Seek(ctx, req.Timestamp)
+	default:
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "unknown command: " + req.Command})
+		return
+	}
+	if err != nil {
+		s.logger.Warn("output sync failed", "command", req.Command, "timestamp", req.Timestamp, "err", err)
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Sent " + req.Command})
 }
@@ -197,7 +224,10 @@ func (s *Server) handleOutputMute(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": err.Error()})
 		return
 	}
-	_ = s.mpv.SetMute(r.Context(), req.Muted)
+	if err := s.mpv.SetMute(r.Context(), req.Muted); err != nil {
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+		return
+	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Mute set"})
 }
 
@@ -263,14 +293,16 @@ func (s *Server) handlePlaybackProfiles(w http.ResponseWriter, r *http.Request) 
 	// when set, otherwise the package's hardcoded default. This keeps
 	// the first-run experience aligned with what /output/start will
 	// actually do.
-	def := s.settings.PlaybackProfile
+	def := s.currentPlaybackProfile()
 	if def == "" {
 		def = playback.DefaultID
 	}
 	// Resolve to a known id — if the stored value is stale (e.g. a
 	// profile was removed in an upgrade), fall back to the canonical
 	// default so the UI doesn't render a missing selection.
-	if _, ok := playback.ByID(def); !ok {
+	// Unavailable profiles are omitted from playback.All(), so they
+	// must not be offered as the default either.
+	if _, err := playback.ByIDAvailable(def); err != nil {
 		def = playback.DefaultID
 	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{

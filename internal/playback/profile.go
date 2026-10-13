@@ -18,23 +18,25 @@
 //
 //   - Mixed-cadence multi-campus deployments are real. A main campus may
 //     broadcast cinema 23.976/24 fps content while a satellite campus
-//     plays it on a 30 Hz projector. Naive playback frame-doubles 24→30
-//     unevenly (one frame in four gets shown 2 frames, three frames get
-//     shown 1 frame each) and the result judders visibly during slow
-//     pans. The fix is `--video-sync=display-resample --interpolation=yes
+//     plays it on a 30 Hz projector. Naive playback shows one source
+//     frame doubled for every 4 source frames (a 2-1-1-1 pattern) and
+//     the result judders visibly during slow pans. The fix is
+//     `--video-sync=display-resample --interpolation=yes
 //     --display-fps-override=30`: mpv resamples the timeline to the
-//     display's refresh and motion-compensates the interpolated frames.
+//     display's refresh and synthesizes the in-between frames.
 //
-//   - Broadcast SDI cards (Decklink etc.) have their own clock and want
-//     `--vo=decklink --video-sync=display-vdrop` with `--hwdec=no` for
-//     deterministic frame timing. Interpolation off — broadcast cards
-//     emit frames at their own SMPTE-locked rate; mpv interpolating on
-//     top introduces phase noise.
+//   - Broadcast SDI output (Decklink) wants `--video-sync=display-vdrop`
+//     with `--hwdec=no`. NOTE: upstream mpv has no `decklink` video
+//     output and no `--decklink-format` option, so the decklink-broadcast
+//     profile is marked Unavailable (see CheckAvailable) and is not
+//     listed by All().
 //
-//   - 60 Hz and 50 Hz TVs differ between regions (NTSC vs PAL). 50 Hz
-//     receiving 24p is 24→50 which is 1:2-1:2-1:2-1:2-1:3 repeating —
-//     interpolation matters. 60 Hz receiving 24p is a clean 2.5×
-//     resample that mpv handles smoothly without interpolation.
+//   - 60 Hz and 50 Hz TVs differ between regions (NTSC vs PAL). 24→50
+//     fills 25 display frames from every 12 source frames (eleven shown
+//     twice, one held for 3), and 30→50 is a 2-2-1 pattern over 3 source
+//     frames; both judder, so interpolation matters. 24→60 is 3:2
+//     pulldown: a regular cadence that still judders on slow pans; the
+//     60 Hz profiles accept that rather than spend GPU on interpolation.
 //
 //   - "Auto" is the safety fallback for operators who don't know or
 //     care; it leaves mpv to its defaults (the prior behavior).
@@ -49,19 +51,24 @@
 //   - --interpolation=yes       : motion-compensated frame interpolation;
 //     spends CPU/GPU to kill cadence judder.
 //   - --display-fps-override=N  : force the assumed display refresh; useful
-//     when EDID lies (projectors, KVMs).
+//     when EDID lies (projectors, KVMs). Requires mpv >= 0.37 (older
+//     releases spell it --override-display-fps).
 //   - --hwdec=auto|videotoolbox|nvdec|vaapi|no : hardware decode selection.
 //     "no" forces software decode for deterministic
 //     timing (broadcast use case).
-//   - --vo=gpu|decklink         : output stage. gpu is the default desktop
-//     path; decklink routes frames to an SDI
-//     board via the BlackmagicDesign SDK.
+//   - --vo=gpu                  : output stage (the default desktop path).
+//     A --vo=decklink stage only exists in custom mpv builds.
 package playback
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 )
+
+// ErrProfileUnavailable is wrapped by Profile.CheckAvailable when a
+// profile can't run on upstream mpv.
+var ErrProfileUnavailable = errors.New("playback profile unavailable")
 
 // VideoSync constants name the mpv --video-sync values this package
 // understands. The strings are passed to mpv unmodified.
@@ -118,11 +125,13 @@ type Profile struct {
 	// profile can claim "we don't touch this".
 	VideoSync string `json:"video_sync"`
 
-	// Interpolation gates --interpolation=yes. Motion-compensated frame
-	// interpolation is the heaviest CPU/GPU lever in this profile;
-	// reserve it for the 24→30 and 24→50 cadence-judder cases where it
+	// Interpolation gates --interpolation=yes. Frame interpolation is
+	// the heaviest CPU/GPU lever in this profile; reserve it for the
+	// 24→30 (2-1-1-1) and 24→50 / 30→50 cadence-judder cases where it
 	// makes a visible difference. Broadcast cards bypass interpolation
-	// (they have their own clock); 24→60 doesn't need it (clean 2.5×).
+	// (they have their own clock). 24→60 is 3:2 pulldown, which also
+	// judders on slow pans; the 60 Hz profiles leave interpolation off
+	// as a CPU/quality trade-off, not because the cadence is clean.
 	Interpolation bool `json:"interpolation"`
 
 	// DisplayFPSOverride is the value passed to --display-fps-override.
@@ -151,6 +160,23 @@ type Profile struct {
 	// UI continues to pick the format separately. When non-empty AND
 	// OutputMode == "decklink", MPVArgs() emits --decklink-format.
 	DecklinkFormat string `json:"decklink_format,omitempty"`
+
+	// Unavailable, when non-empty, is the operator-facing reason this
+	// profile cannot be used with upstream mpv. Such profiles stay
+	// resolvable through ByID (so stored settings / legacy requests get
+	// a clear error instead of silently changing behaviour) but are not
+	// listed by All(). Callers must check CheckAvailable before
+	// launching mpv.
+	Unavailable string `json:"unavailable,omitempty"`
+}
+
+// CheckAvailable returns nil when the profile can be launched, or an
+// error wrapping ErrProfileUnavailable with the reason.
+func (p Profile) CheckAvailable() error {
+	if p.Unavailable == "" {
+		return nil
+	}
+	return fmt.Errorf("%w: %s: %s", ErrProfileUnavailable, p.ID, p.Unavailable)
 }
 
 // MPVArgs returns the mpv flag fragment this profile contributes. Pure
@@ -206,7 +232,9 @@ func (p Profile) MPVArgs() []string {
 	}
 
 	// --display-fps-override only when non-zero (zero = let mpv
-	// autodetect). We render integer rates as plain decimals and
+	// autodetect). The flag name needs mpv >= 0.37; earlier releases
+	// call it --override-display-fps. There is no mpv version probe in
+	// this package, so the modern spelling is emitted unconditionally. We render integer rates as plain decimals and
 	// fractional rates (rare in this context — projectors quote integer
 	// refresh) as the float form mpv accepts.
 	if p.DisplayFPSOverride > 0 {
@@ -237,8 +265,10 @@ func formatFPS(v float64) string {
 // (which fetches /api/playback-profiles), and the resolver in
 // MPVService.Start. Order is the order shown in the UI picker.
 //
-// The seven profiles cover the cross-product of (projector vs TV vs
+// The profiles cover the cross-product of (projector vs TV vs
 // broadcast) × (24 / 30 / 50 / 60 Hz) without exploding into 16+ entries.
+// decklink-broadcast is kept in the registry (so ByID resolves it with
+// a clear CheckAvailable error) but is Unavailable on upstream mpv.
 // The selection rationale lives in docs/playback-profiles.md.
 var profiles = []Profile{
 	{
@@ -267,8 +297,8 @@ var profiles = []Profile{
 	{
 		ID:    "projector-30",
 		Label: "Projector 30Hz",
-		Description: "30Hz projector receiving 24fps cinema. Interpolation ON: kills the uneven 24→30 cadence judder. " +
-			"Costs CPU/GPU but is the only fix for the 1-2-1-2-1-3 frame-doubling pattern.",
+		Description: "30Hz projector receiving 24fps cinema. Interpolation ON: 24→30 doubles one of every 4 source frames " +
+			"(a 2-1-1-1 pattern) and judders on pans. Costs CPU/GPU but smooths the cadence.",
 		VideoSync:          VideoSyncDisplayResample,
 		Interpolation:      true,
 		DisplayFPSOverride: 30,
@@ -278,8 +308,8 @@ var profiles = []Profile{
 	{
 		ID:    "projector-60",
 		Label: "Projector 60Hz",
-		Description: "60Hz projector receiving 24fps cinema. Clean 2.5× resample; no interpolation needed " +
-			"(mpv's display-resample handles 24→60 without judder).",
+		Description: "60Hz projector receiving 24fps cinema. 24→60 is 3:2 pulldown: a regular cadence that still judders " +
+			"on slow pans. Interpolation off to save GPU; use projector-24 if the projector can run at 24Hz.",
 		VideoSync:          VideoSyncDisplayResample,
 		Interpolation:      false,
 		DisplayFPSOverride: 60,
@@ -289,8 +319,8 @@ var profiles = []Profile{
 	{
 		ID:    "tv-60",
 		Label: "Consumer TV 60Hz",
-		Description: "Most US/JP consumer TVs and PC monitors at 60Hz. Resample the timeline; interpolation off " +
-			"(60Hz panels handle most source rates cleanly via resample).",
+		Description: "Most US/JP consumer TVs and PC monitors at 60Hz. Resample the timeline; interpolation off. " +
+			"30/60fps sources map cleanly; 24fps cinema shows 3:2 pulldown judder on slow pans.",
 		VideoSync:          VideoSyncDisplayResample,
 		Interpolation:      false,
 		DisplayFPSOverride: 60,
@@ -301,7 +331,7 @@ var profiles = []Profile{
 		ID:    "tv-50-pal",
 		Label: "PAL TV 50Hz",
 		Description: "UK/EU consumer TVs at 50Hz receiving 24fps cinema or 30fps NTSC content. Interpolation ON: " +
-			"24→50 and 30→50 cadences both judder without it.",
+			"24→50 holds one frame in 12 for 3 display frames, and 30→50 is a 2-2-1 pattern; both judder without it.",
 		VideoSync:          VideoSyncDisplayResample,
 		Interpolation:      true,
 		DisplayFPSOverride: 50,
@@ -322,21 +352,42 @@ var profiles = []Profile{
 		// control fills it in per-request, and handlers_output merges
 		// the request value into the resolved profile before calling
 		// MPVService.Start.
+		Unavailable: "upstream mpv has no decklink video output (--vo=decklink) or --decklink-format option; " +
+			"SDI playback needs a custom mpv build or a different output path",
 	},
 }
 
-// All returns every profile in registry order. Returns a fresh slice
-// so callers can sort/filter without mutating the package-level
-// registry.
+// All returns every available profile in registry order (profiles with
+// a non-empty Unavailable reason are omitted so the UI doesn't offer
+// them). Returns a fresh slice so callers can sort/filter without
+// mutating the package-level registry.
 func All() []Profile {
-	out := make([]Profile, len(profiles))
-	copy(out, profiles)
+	out := make([]Profile, 0, len(profiles))
+	for _, p := range profiles {
+		if p.Unavailable == "" {
+			out = append(out, p)
+		}
+	}
 	return out
 }
 
-// ByID looks up a profile by stable identifier. Returns the zero value
-// and false when the id is unknown; callers must check the bool before
-// consuming the profile.
+// ByIDAvailable is ByID followed by CheckAvailable: it returns an error
+// for unknown ids and for profiles that can't run on upstream mpv.
+func ByIDAvailable(id string) (Profile, error) {
+	p, ok := ByID(id)
+	if !ok {
+		return Profile{}, fmt.Errorf("unknown playback profile %q", id)
+	}
+	if err := p.CheckAvailable(); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+
+// ByID looks up a profile by stable identifier, including unavailable
+// ones (check Profile.CheckAvailable before launching). Returns the zero
+// value and false when the id is unknown; callers must check the bool
+// before consuming the profile.
 func ByID(id string) (Profile, bool) {
 	for _, p := range profiles {
 		if p.ID == id {

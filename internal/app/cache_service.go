@@ -26,6 +26,13 @@ type CacheService struct {
 	logger   *slog.Logger
 }
 
+// cacheRequestTimeout caps a single playlist or segment fetch.
+const cacheRequestTimeout = 30 * time.Second
+
+// errInvalidCacheRequest is returned by StartCaching for an unsafe event
+// ID or a non-http(s) remote URL.
+var errInvalidCacheRequest = errors.New("invalid event_id or remote_url")
+
 // cacheLoop tracks both the cancel-fn and the done-channel for a single
 // in-flight cache goroutine. Shutdown waits on done after cancelling so
 // every loop has time to flush and close its files cleanly.
@@ -38,13 +45,10 @@ func NewCacheService(settings AppSettings, logger *slog.Logger) *CacheService {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	// No client-level timeout: per-request ctx (set in fetchText /
-	// downloadFile via http.NewRequestWithContext) now bounds the call.
-	// The previous 10s client.Timeout was a coarse fallback that ate
-	// the cache loop's `Stop` cancellation up to a full 10s after
-	// StopCaching landed — the architect's exact concern (item #7).
-	// With ctx-driven cancellation a Stop now propagates within ~1s
-	// because the loop-scoped ctx is woven into every outbound fetch.
+	// Every outbound fetch is bounded twice: by the loop ctx (so Stop
+	// lands promptly) and by a per-request timeout (cacheRequestTimeout,
+	// applied in fetchText / downloadFile) so a peer that accepts the
+	// connection and then stalls can't wedge the loop forever.
 	return &CacheService{
 		client:   &http.Client{},
 		active:   make(map[string]cacheLoop),
@@ -64,14 +68,20 @@ func NewCacheService(settings AppSettings, logger *slog.Logger) *CacheService {
 // request that started it. The child still observes parent
 // cancellation if the daemon is shutting down. Explicit StopCaching
 // invokes the locally-captured cancel-fn for fast teardown.
-func (c *CacheService) StartCaching(parent context.Context, eventID, remoteURL string) {
+//
+// eventID must pass validID and remoteURL must be an http(s) URL;
+// otherwise errInvalidCacheRequest is returned and nothing is created.
+func (c *CacheService) StartCaching(parent context.Context, eventID, remoteURL string) error {
+	if !validID(eventID) || !validHTTPURL(remoteURL) {
+		return errInvalidCacheRequest
+	}
 	if parent == nil {
 		parent = context.Background()
 	}
 	c.mu.Lock()
 	if _, ok := c.active[eventID]; ok {
 		c.mu.Unlock()
-		return
+		return nil
 	}
 	// Detach the request's lifetime so a client disconnect doesn't
 	// kill the cache loop; keep the parent's *values* if any.
@@ -95,6 +105,7 @@ func (c *CacheService) StartCaching(parent context.Context, eventID, remoteURL s
 			"component", "cache.loop",
 			"event_id", eventID)
 	}()
+	return nil
 }
 
 // StopCaching cancels a single in-flight loop and waits for it to exit.
@@ -138,9 +149,15 @@ func (c *CacheService) StopAll() {
 // DeleteCache stops any active loop for eventID then removes its on-disk
 // segments. ctx is forwarded into StopCaching but the file removal is
 // best-effort and unconditional.
-func (c *CacheService) DeleteCache(ctx context.Context, eventID string) {
+//
+// An invalid eventID (including "") is rejected so the removal can never
+// target CacheDir itself or anything outside it.
+func (c *CacheService) DeleteCache(ctx context.Context, eventID string) error {
+	if !validID(eventID) {
+		return errInvalidCacheRequest
+	}
 	c.StopCaching(ctx, eventID)
-	_ = os.RemoveAll(filepath.Join(c.settings.CacheDir, eventID))
+	return os.RemoveAll(filepath.Join(c.settings.CacheDir, eventID))
 }
 
 // Status reports cache state for eventID. ctx is accepted for API
@@ -149,6 +166,9 @@ func (c *CacheService) DeleteCache(ctx context.Context, eventID string) {
 // makes future per-segment HEAD probes ctx-aware.
 func (c *CacheService) Status(ctx context.Context, eventID string) CacheStatus {
 	_ = ctx
+	if !validID(eventID) {
+		return CacheStatus{}
+	}
 	eventDir := filepath.Join(c.settings.CacheDir, eventID)
 	if _, err := os.Stat(eventDir); err != nil {
 		return CacheStatus{Cached: false, Active: false, Segments: 0, SizeBytes: 0}
@@ -199,23 +219,25 @@ func (c *CacheService) downloadLoop(ctx context.Context, eventID, baseURL, outpu
 
 		content, err := c.fetchText(ctx, playlistURL)
 		if err == nil {
-			// Atomic write — readers (the decoder serving /cache/<id>/master.m3u8)
-			// must never see a half-written playlist.
-			if werr := atomicfile.Write(
-				filepath.Join(outputDir, "master.m3u8"),
-				[]byte(content), 0644); werr != nil {
-				c.logger.Warn("cache: playlist write failed",
-					"event_id", eventID, "err", werr)
-			}
-
 			if strings.Contains(content, "#EXT-X-ENDLIST") {
 				isLive = false
 			}
 
 			segments := parseSegments(content)
 			newDownloads := 0
+			// complete stays true only if every segment the playlist
+			// references is a safe name and is on disk locally.
+			complete := true
 			for _, segment := range segments {
 				if downloaded[segment] {
+					continue
+				}
+				// Segment names come from an untrusted peer; anything
+				// that isn't a plain file name could escape outputDir.
+				if !safeSegmentName(segment) {
+					c.logger.Warn("cache: skipping unsafe segment name",
+						"event_id", eventID, "segment", segment)
+					complete = false
 					continue
 				}
 				// Cheap pre-check: if Stop landed mid-batch we'd
@@ -228,10 +250,29 @@ func (c *CacheService) downloadLoop(ctx context.Context, eventID, baseURL, outpu
 				if err := c.downloadFile(ctx, url, filepath.Join(outputDir, segment)); err == nil {
 					downloaded[segment] = true
 					newDownloads++
+				} else {
+					complete = false
 				}
 			}
 
-			if !isLive && newDownloads == 0 {
+			// Publish the playlist only when every segment it lists is
+			// on disk, so a reader never requests a file that failed to
+			// download or was rejected as unsafe. Otherwise keep the
+			// previous playlist and retry on the next cycle. Atomic so
+			// readers never see a half-written playlist.
+			if complete {
+				if werr := atomicfile.Write(
+					filepath.Join(outputDir, "master.m3u8"),
+					[]byte(content), 0644); werr != nil {
+					c.logger.Warn("cache: playlist write failed",
+						"event_id", eventID, "err", werr)
+				}
+			} else {
+				c.logger.Warn("cache: playlist held back; some segments missing or unsafe",
+					"event_id", eventID)
+			}
+
+			if !isLive && complete && newDownloads == 0 {
 				completeCycles++
 				if completeCycles >= 2 {
 					// VOD source has stabilised: nothing new for two
@@ -268,6 +309,8 @@ func (c *CacheService) downloadLoop(ctx context.Context, eventID, baseURL, outpu
 // peer that opens the connection but stalls mid-body still gets ripped
 // out by ctx cancellation. Per the architect's #7 concern.
 func (c *CacheService) fetchText(ctx context.Context, url string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, cacheRequestTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
@@ -289,7 +332,11 @@ func (c *CacheService) fetchText(ctx context.Context, url string) (string, error
 
 // downloadFile fetches url and streams the body to path. ctx scopes the
 // whole transfer so a Stop that arrives mid-segment cancels the copy.
+// The body lands in a temp file that is renamed over path only once the
+// download completes, so readers never serve a truncated segment.
 func (c *CacheService) downloadFile(ctx context.Context, url, path string) error {
+	ctx, cancel := context.WithTimeout(ctx, cacheRequestTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -302,16 +349,7 @@ func (c *CacheService) downloadFile(ctx context.Context, url, path string) error
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return errors.New("bad status")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	file, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	_, err = io.Copy(file, resp.Body)
-	return err
+	return atomicfile.WriteFrom(path, resp.Body, 0644)
 }
 
 func parseSegments(content string) []string {
@@ -322,11 +360,9 @@ func parseSegments(content string) []string {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "#EXT-X-MAP:URI=") {
-			parts := strings.Split(line, "URI=")
-			if len(parts) == 2 {
-				segment := strings.Trim(parts[1], "\"")
-				segments = append(segments, segment)
+		if strings.HasPrefix(line, "#EXT-X-MAP:") {
+			if uri := m3u8Attr(line, "URI"); uri != "" {
+				segments = append(segments, uri)
 			}
 			continue
 		}
@@ -336,4 +372,43 @@ func parseSegments(content string) []string {
 		segments = append(segments, line)
 	}
 	return segments
+}
+
+// m3u8Attr returns the value of a quoted or bare attribute in an HLS
+// tag line, e.g. URI from `#EXT-X-MAP:URI="init.mp4",BYTERANGE="..."`.
+func m3u8Attr(line, name string) string {
+	i := strings.Index(line, ":")
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+1:]
+	for rest != "" {
+		eq := strings.Index(rest, "=")
+		if eq < 0 {
+			return ""
+		}
+		key := strings.TrimSpace(rest[:eq])
+		rest = rest[eq+1:]
+		var val string
+		if strings.HasPrefix(rest, "\"") {
+			end := strings.Index(rest[1:], "\"")
+			if end < 0 {
+				return ""
+			}
+			val = rest[1 : end+1]
+			rest = rest[end+2:]
+		} else {
+			end := strings.Index(rest, ",")
+			if end < 0 {
+				end = len(rest)
+			}
+			val = rest[:end]
+			rest = rest[end:]
+		}
+		rest = strings.TrimPrefix(rest, ",")
+		if key == name {
+			return val
+		}
+	}
+	return ""
 }

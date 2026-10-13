@@ -56,13 +56,41 @@ window.OCFormat = (() => {
     return `${Math.round(bps / 1000)} kbps`;
   }
 
-  // presetSummary renders the "what does this preset give me" hint under
-  // the dropdown. Resolution is implied by bitrate target since the
-  // backend chooses 720p for low and 1080p for everything else.
+  // presetSummary renders the "what does this preset give me" hint for
+  // an internal/quality PresetSummary (the /api/quality catalog shape:
+  // resolution, fps / fps_int, video_bitrate_kbps).
   function presetSummary(preset) {
     if (!preset) return "";
-    return `${preset.resolution} · ${formatBitrate(preset.bitrate)} · ${preset.fps} fps`;
+    const res = preset.resolution || (preset.width && preset.height ? `${preset.width}x${preset.height}` : "");
+    const fps = preset.fps || preset.fps_int;
+    const parts = [];
+    if (res) parts.push(res);
+    if (preset.video_bitrate_kbps) parts.push(formatBitrate(preset.video_bitrate_kbps * 1000));
+    if (fps) parts.push(`${fps} fps`);
+    return parts.join(" · ");
   }
 
-  return { formatTime, parseTime, formatBytes, formatDate, formatBitrate, presetSummary };
+  // eventFps returns the event's frame rate when the backend supplied a
+  // usable one, else 30. Frame-step and bookmark math share this so a
+  // 25 / 50 / 60 fps event doesn't land between frames.
+  function eventFps(ev) {
+    const n = Number(ev?.fps);
+    return Number.isFinite(n) && n > 0 ? n : 30;
+  }
+
+  // errorDetail turns a raw error response body into something a human
+  // can read. The backend answers with {"detail": "..."}; fall back to
+  // the raw text, then to the HTTP status.
+  function errorDetail(text, status) {
+    if (text) {
+      try {
+        const data = JSON.parse(text);
+        if (data && (data.detail || data.error)) return String(data.detail || data.error);
+      } catch (_) {}
+      return String(text).trim();
+    }
+    return status ? `HTTP ${status}` : "Unknown error";
+  }
+
+  return { formatTime, parseTime, formatBytes, formatDate, formatBitrate, presetSummary, eventFps, errorDetail };
 })();

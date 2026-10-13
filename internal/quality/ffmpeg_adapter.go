@@ -110,9 +110,11 @@ func (f FFmpegPreset) PixelFormat() string {
 	return f.Preset.PixFmt
 }
 
-// Profile returns the H.264 profile name. The preset table does not
-// declare per-row profile values; we infer from PixFmt (10-bit
-// implies main10 for HEVC, 8-bit yuv420p uses "high" for H.264).
+// Profile returns the codec profile name. The preset table does not
+// declare per-row profile values; we infer from PixFmt (10-bit implies
+// HEVC "main10", 8-bit yuv420p uses H.264 "high"). The ffmpeg args
+// builder uses PrefersHEVC() to pick an HEVC encoder for main10 presets
+// and maps the profile back to "high" if it has to fall back to H.264.
 func (f FFmpegPreset) Profile() string {
 	if f.Preset.PixFmt == "yuv420p10le" {
 		return "main10"
@@ -128,9 +130,9 @@ func (f FFmpegPreset) Level() string { return f.Preset.Level() }
 // "veryfast" / "p4" / etc. for the specific encoder.
 func (f FFmpegPreset) VideoEncoderPreset() string {
 	// quality.Preset does not declare per-encoder speed presets in
-	// the table because each backend has its own keyword space.
-	// The supervisor's per-encoder switch applies sensible defaults
-	// (veryfast for x264, p5 for NVENC, etc.) when this returns "".
+	// the table. ffmpeg.Config applies per-encoder defaults when this
+	// returns "" (veryfast for x264/x265/QSV, p4 for NVENC) and
+	// translates x264-style names for NVENC/QSV.
 	return ""
 }
 
@@ -163,11 +165,10 @@ func (f FFmpegPreset) WantsBFrames() bool {
 // Optional richer interfaces (type-asserted by internal/ffmpeg)
 // -----------------------------------------------------------------------------
 
-// ColorPresetAware exposes broadcast-grade color VUI hints that get
-// emitted BEFORE -c:v so hardware encoders bake them into the SPS at
-// init. The ffmpeg package type-asserts to this interface inside
-// encoderArgs() and emits `-color_primaries / -color_trc / -colorspace
-// / -color_range` when the assertion succeeds.
+// ColorPresetAware exposes broadcast-grade color hints. The ffmpeg
+// package type-asserts to this interface and (a) tags frames with a
+// `setparams` filter in the -vf chain and (b) emits `-color_primaries /
+// -color_trc / -colorspace / -color_range` before -c:v.
 //
 // The narrow QualityPreset interface deliberately omits these — most
 // callers (DefaultPreset, SimplePreset) don't carry color metadata
@@ -208,11 +209,10 @@ type AudioFormatAware interface {
 	AudioChannels() int
 }
 
-// HEVCAware reports whether the preset's recommended encoder list
-// contains HEVC variants. The supervisor uses this to choose
-// hevc_videotoolbox / hevc_nvenc / libx265 over the H.264 fallback.
-// Returns the first HEVC encoder from the catalog or empty when
-// none are present.
+// HEVCAware reports whether the preset's recommended encoder list is
+// HEVC-only. Mirrors ffmpeg.HEVCAware: the args builder promotes the
+// encoder family to hevc_videotoolbox / hevc_nvenc / libx265, falling
+// back to 8-bit H.264 when no HEVC encoder is usable.
 type HEVCAware interface {
 	PrefersHEVC() bool
 }

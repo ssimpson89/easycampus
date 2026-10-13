@@ -8,6 +8,8 @@
 package atomicfile
 
 import (
+	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -18,6 +20,13 @@ import (
 // file is created in the same directory as the target so the final rename
 // is a same-filesystem operation (atomic on POSIX).
 func Write(path string, data []byte, mode os.FileMode) error {
+	return WriteFrom(path, bytes.NewReader(data), mode)
+}
+
+// WriteFrom streams r into path atomically with the given mode. Same
+// guarantees as Write, without buffering the whole payload in memory —
+// used for downloaded media segments.
+func WriteFrom(path string, r io.Reader, mode os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
@@ -30,7 +39,7 @@ func Write(path string, data []byte, mode os.FileMode) error {
 	// On any error path below, remove the temp file so we don't litter.
 	cleanup := func() { _ = os.Remove(tmpPath) }
 
-	if _, err := f.Write(data); err != nil {
+	if _, err := io.Copy(f, r); err != nil {
 		_ = f.Close()
 		cleanup()
 		return err

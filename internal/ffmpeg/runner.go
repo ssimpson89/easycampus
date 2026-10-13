@@ -25,16 +25,16 @@ type Job struct {
 	logPath   string
 	streamKey string
 
-	mu       sync.Mutex
-	pid      int
-	finished bool
-	err      error
-	progress Progress
+	mu        sync.Mutex
+	pid       int
+	finished  bool
+	err       error
+	progress  Progress
 	startedAt time.Time
 	stoppedAt time.Time
 
-	cancel  context.CancelFunc
-	done    chan struct{}
+	cancel context.CancelFunc
+	done   chan struct{}
 
 	onProgress func(Progress)
 	onComplete func(err error)
@@ -134,9 +134,15 @@ func (j *Job) run(ctx context.Context, cmd *exec.Cmd, stdout, stderr io.ReadClos
 		j.writeLog(stderr)
 	}()
 
-	// Watch ctx for cancellation while waiting on the process.
+	// cmd.Wait closes the pipes, so it must only run after both readers
+	// hit EOF; otherwise FFmpeg's last stderr lines (usually the actual
+	// error) are lost. The select below is the separate cancellation
+	// watcher that signals the process.
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
+	go func() {
+		wg.Wait()
+		waitCh <- cmd.Wait()
+	}()
 	var exitErr error
 	select {
 	case exitErr = <-waitCh:
@@ -146,7 +152,6 @@ func (j *Job) run(ctx context.Context, cmd *exec.Cmd, stdout, stderr io.ReadClos
 			exitErr = errors.New("job cancelled")
 		}
 	}
-	wg.Wait()
 	j.closeLog()
 
 	j.mu.Lock()

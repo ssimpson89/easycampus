@@ -43,7 +43,21 @@ type FFmpegService struct {
 	startedAtWall  time.Time
 	lastError      string
 	cancelKey      string // unused currently — placeholder for stream-key redaction wiring
+
+	// jobs tracks one-shot ffmpeg jobs (uploads / external sources) by
+	// PID. Only these PIDs and the supervisor's own PID may be killed
+	// through the API — a PID read from disk or a request body is never
+	// trusted on its own.
+	jobs map[int]*ocffmpeg.Job
 }
+
+// errStreamRunning is returned by StartStream when a live stream is
+// already active. Handlers map it to 409 Conflict.
+var errStreamRunning = errors.New("stream already running")
+
+// errPIDNotTracked is returned by ForceKillPID for a PID that is neither
+// the supervised encoder nor a tracked job.
+var errPIDNotTracked = errors.New("pid is not a process managed by this server")
 
 // NewFFmpegService constructs the shim. Wires up the supervisor with
 // easycampus-go's stall/restart defaults and points the pid file at
@@ -81,7 +95,12 @@ func NewFFmpegService(settings AppSettings, logger *slog.Logger) *FFmpegService 
 		logger:   logger,
 		scanner:  ocdevices.NewScanner("ffmpeg"),
 		sup:      sup,
+		jobs:     make(map[int]*ocffmpeg.Job),
 	}
+	// Observe supervisor exits that nobody asked for (restart budget
+	// exhausted / repeated start failures) so the event doesn't stay
+	// "running" forever in info.json.
+	sup.SetOnStateChange(svc.onSupervisorStateChange)
 	if settings.AdaptiveBitrate {
 		cfg := ocffmpeg.DefaultAdaptiveConfig()
 		cfg.Enabled = true
@@ -125,6 +144,122 @@ func (qualityPresetTier) Higher(currentID, targetID string) (ocffmpeg.QualityPre
 		return nil, false
 	}
 	return ocquality.AsFFmpegPreset(p), true
+}
+
+// onSupervisorStateChange is invoked (without the supervisor lock held)
+// on every supervisor state transition. When the supervisor gives up
+// (StateFailed) the current event is marked "failed" and forgotten.
+// User-initiated stops are handled by handleStreamStop.
+func (f *FFmpegService) onSupervisorStateChange() {
+	st := f.sup.Status()
+	if st.State != ocffmpeg.StateFailed {
+		return
+	}
+	f.mu.Lock()
+	eventID := f.currentEventID
+	if eventID == "" || eventID != st.EventID {
+		f.mu.Unlock()
+		return
+	}
+	f.currentEventID = ""
+	f.startedAtWall = time.Time{}
+	f.lastError = st.LastError
+	adaptive := f.adaptive
+	f.mu.Unlock()
+
+	if adaptive != nil {
+		adaptive.OnStreamStop()
+	}
+	if f.settings.EventsDir != "" && validID(eventID) {
+		updateInfoStatus(filepath.Join(f.settings.EventsDir, eventID, "info.json"), "failed", 0)
+	}
+	f.logger.Warn("live stream failed; event marked failed",
+		"event_id", eventID, "last_error", st.LastError, "last_exit", st.LastExit)
+}
+
+// StartJob launches a one-shot ffmpeg job and tracks its PID until it
+// exits, so ForceKillPID / CancelJob can act on it.
+func (f *FFmpegService) StartJob(cfg ocffmpeg.Config, opts ocffmpeg.JobOptions) (*ocffmpeg.Job, error) {
+	job, err := ocffmpeg.StartJob(cfg, opts)
+	if err != nil {
+		return nil, err
+	}
+	pid := job.PID()
+	f.mu.Lock()
+	f.jobs[pid] = job
+	f.mu.Unlock()
+	go func() {
+		<-job.Done()
+		f.mu.Lock()
+		if f.jobs[pid] == job {
+			delete(f.jobs, pid)
+		}
+		f.mu.Unlock()
+	}()
+	return job, nil
+}
+
+// CancelJob cancels the tracked job with the given PID. Returns false
+// when the PID is not a live tracked job (nothing is signalled).
+func (f *FFmpegService) CancelJob(pid int) bool {
+	f.mu.Lock()
+	job, ok := f.jobs[pid]
+	f.mu.Unlock()
+	if !ok || job.IsFinished() {
+		return false
+	}
+	job.Cancel()
+	return true
+}
+
+// CancelJobAndWait cancels the tracked job with the given PID and
+// blocks until it exits or ctx is done. Returns false when pid is not a
+// live tracked job. Callers that delete a job's directory use this so
+// FFmpeg isn't still holding (or writing into) files being removed.
+func (f *FFmpegService) CancelJobAndWait(ctx context.Context, pid int) bool {
+	f.mu.Lock()
+	job, ok := f.jobs[pid]
+	f.mu.Unlock()
+	if !ok || job.IsFinished() {
+		return false
+	}
+	job.Cancel()
+	select {
+	case <-job.Done():
+	case <-ctx.Done():
+	}
+	return true
+}
+
+// StopAllJobs cancels every tracked upload/external job and waits for
+// them to exit or for ctx to expire. Called from Server.Shutdown so
+// conversions don't outlive the daemon (macOS and Windows have no
+// parent-death signal to catch them).
+func (f *FFmpegService) StopAllJobs(ctx context.Context) {
+	f.mu.Lock()
+	jobs := make([]*ocffmpeg.Job, 0, len(f.jobs))
+	for _, j := range f.jobs {
+		jobs = append(jobs, j)
+	}
+	f.mu.Unlock()
+	for _, j := range jobs {
+		j.Cancel()
+	}
+	for _, j := range jobs {
+		select {
+		case <-j.Done():
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// JobRunning reports whether pid is a tracked, still-running job.
+func (f *FFmpegService) JobRunning(pid int) bool {
+	f.mu.Lock()
+	job, ok := f.jobs[pid]
+	f.mu.Unlock()
+	return ok && !job.IsFinished()
 }
 
 // IsRunning reports whether the live encoder is active.
@@ -184,7 +319,7 @@ func (f *FFmpegService) StartStream(ctx context.Context, eventID string, config 
 		return err
 	}
 	if f.IsRunning() {
-		return errors.New("stream already running")
+		return errStreamRunning
 	}
 	if config.VideoFramerate <= 0 {
 		return errors.New("framerate must be positive")
@@ -224,16 +359,32 @@ func (f *FFmpegService) StartStream(ctx context.Context, eventID string, config 
 	// pass the request ctx down — a request cancellation must not kill
 	// a multi-hour live encode. StopStream(ctx) is the only path that
 	// tears the supervisor down.
+	//
+	// currentEventID is recorded before sup.Start so the failure hook
+	// (onSupervisorStateChange) can never observe a failed supervisor
+	// whose event it doesn't know about yet.
+	f.mu.Lock()
+	prevEventID, prevStarted := f.currentEventID, f.startedAtWall
+	f.currentEventID = eventID
+	f.startedAtWall = time.Now()
+	f.mu.Unlock()
 	if err := f.sup.Start(cfg, eventID); err != nil {
 		f.mu.Lock()
-		f.lastError = err.Error()
+		if f.currentEventID == eventID {
+			f.currentEventID, f.startedAtWall = prevEventID, prevStarted
+		}
+		if !f.sup.IsRunning() {
+			f.lastError = err.Error()
+		}
 		f.mu.Unlock()
+		if f.IsRunning() {
+			// Lost a race with a concurrent start.
+			return errStreamRunning
+		}
 		return err
 	}
 
 	f.mu.Lock()
-	f.currentEventID = eventID
-	f.startedAtWall = time.Now()
 	f.lastError = ""
 	adaptive := f.adaptive
 	f.mu.Unlock()
@@ -264,20 +415,25 @@ func (f *FFmpegService) StopStream(ctx context.Context) error {
 	return nil
 }
 
-// ForceKillPID terminates a specific PID. If it's the currently-supervised
-// stream, route through StopStream so the supervisor cleans up correctly.
-// Otherwise terminate the bare PID (used for upload-job cleanup paths).
+// ForceKillPID terminates a PID managed by this server. If it's the
+// currently-supervised stream, route through StopStream so the
+// supervisor cleans up correctly; if it's a tracked upload / external
+// source job, cancel that job. Any other PID is refused with
+// errPIDNotTracked — the API must never become a generic process killer.
 //
 // ctx scopes the supervisor-stop path only — same rationale as StopStream.
-func (f *FFmpegService) ForceKillPID(ctx context.Context, pid int) bool {
+func (f *FFmpegService) ForceKillPID(ctx context.Context, pid int) (bool, error) {
 	if pid <= 0 {
-		return false
+		return false, errPIDNotTracked
 	}
 	if f.sup.Status().PID == pid {
 		_ = f.StopStream(ctx)
-		return true
+		return true, nil
 	}
-	return terminateProcess(pid) == nil
+	if f.CancelJob(pid) {
+		return true, nil
+	}
+	return false, errPIDNotTracked
 }
 
 // GetStatus returns the legacy StreamStatus shape that handlers_system /
@@ -308,6 +464,7 @@ func (f *FFmpegService) GetStatus(ctx context.Context) StreamStatus {
 		StartedAt:     startedAtWall,
 		FFMpegPID:     st.PID,
 		LastError:     lastError,
+		QualityPreset: st.PresetID,
 	}
 }
 

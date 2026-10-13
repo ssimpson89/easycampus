@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+  # Manual runs build a snapshot (no tag required, nothing published)
+  # so the pipeline can be smoke-tested from the Actions tab.
   workflow_dispatch:
 
 permissions:
@@ -24,11 +26,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Gate the release on the test suite — a green tag should never
-      # publish broken binaries. Vet + race-clean unit tests across every
-      # internal package.
-      - name: Test
-        run: go test -race -count=1 ./...
+      # Gate the release on the full CI check: a green tag should never
+      # publish broken binaries. `make check` = gofmt + go vet + race-
+      # clean unit tests across every package.
+      - name: Check
+        run: make check
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
@@ -39,6 +41,8 @@ jobs:
           # of breaking config changes in GoReleaser) while still
           # picking up v2.x bug fixes.
           version: "~> v2"
-          args: release --clean
+          # Tag pushes publish; workflow_dispatch builds a snapshot
+          # (release --clean fails without a tag).
+          args: ${{ github.event_name == 'workflow_dispatch' && 'release --snapshot --clean' || 'release --clean' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

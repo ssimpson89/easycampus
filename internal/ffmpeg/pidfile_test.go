@@ -96,6 +96,9 @@ func TestIsFFmpegCommandLine(t *testing.T) {
 		{"ffmpeg", true},
 		{"FFMPEG -i x.mov y.mov", true}, // case-insensitive on basename
 		{"ffmpeg.test -test.run X", false},
+		{"ffmpeg.exe -i x.mov y.mov", true},
+		{`C:\\ffmpeg\\bin\\FFMPEG.EXE -i x`, true},
+		{"ffmpeg.exe.bak -i x", false},
 		{"go run main.go", false},
 		{"", false},
 	}

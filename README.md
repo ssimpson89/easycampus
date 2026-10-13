@@ -29,7 +29,7 @@ EasyCampus turns two ordinary computers on the same network into a live video sy
 
 | Role | Hardware | Software |
 | --- | --- | --- |
-| **Encoder** (by the camera) | A Mac mini, small Linux box, or Windows PC with a webcam or capture card | [FFmpeg](https://ffmpeg.org/download.html) |
+| **Encoder** (by the camera) | A Mac mini or small Linux box with a webcam or capture card | [FFmpeg](https://ffmpeg.org/download.html) |
 | **Decoder** (by the screen) | Any computer with HDMI to the projector or TV | [FFmpeg](https://ffmpeg.org/download.html) and [mpv](https://mpv.io/installation/) |
 
 Both computers need to be on the same network. For a quick test, one computer can play both roles.
@@ -45,16 +45,15 @@ sudo apt install ffmpeg mpv
 
 # Fedora
 sudo dnf install ffmpeg mpv
-
-# Windows
-winget install Gyan.FFmpeg
 ```
+
+EasyCampus runs on macOS and Linux. Windows is not supported for now.
 
 ## Getting started
 
 ### 1. Download EasyCampus
 
-Grab the latest build for your computer from the [Releases page](https://github.com/ssimpson89/easycampus/releases). There are downloads for macOS and Linux, for both Intel and Apple Silicon / ARM. Unzip it and you'll find a single `easycampus` program. Do this on both computers. On Windows, build it from source using [docs/development.md](docs/development.md).
+Grab the latest build for your computer from the [Releases page](https://github.com/ssimpson89/easycampus/releases). There are downloads for macOS and Linux, for both Intel and Apple Silicon / ARM. Unzip it and you'll find a single `easycampus` program. Do this on both computers.
 
 ### 2. Set up the encoder (the computer by the camera)
 
@@ -103,10 +102,7 @@ Use whatever address you type into the decoder's browser to reach the decoder it
 
 ## Settings
 
-EasyCampus works out of the box. If you want to change something, edit the settings file it creates on first run:
-
-- macOS and Linux: `~/.easycampus/config.yaml`
-- Windows: `%USERPROFILE%\.easycampus\config.yaml`
+EasyCampus works out of the box. If you want to change something, edit the settings file it creates on first run, `~/.easycampus/config.yaml`.
 
 The file has comments explaining each setting. The ones people usually change:
 

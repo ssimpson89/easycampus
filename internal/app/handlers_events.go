@@ -43,11 +43,15 @@ func (s *Server) handleEventDelete(w http.ResponseWriter, r *http.Request) {
 	// Wait (bounded) for a cancelled job to exit before its directory is
 	// removed, so FFmpeg isn't writing into an unlinked dir and Windows
 	// doesn't refuse to delete files it still holds open.
+	// Hold the per-event bookmark lock for the whole delete so a
+	// bookmark write can't land between RemoveAll and the response.
+	unlock := s.bookmarkLocks.lock(eventID)
 	err := deleteEvent(s.settings, eventID, func(pid int) {
 		waitCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
 		s.ffmpeg.CancelJobAndWait(waitCtx, pid)
 	})
+	unlock()
 	if errors.Is(err, fs.ErrNotExist) {
 		s.writeJSON(w, http.StatusNotFound, map[string]string{"detail": "Event not found"})
 		return
@@ -103,6 +107,10 @@ func (s *Server) handleEventBookmarks(w http.ResponseWriter, r *http.Request) {
 			}
 			if errors.Is(err, errBookmarkExists) {
 				s.writeJSON(w, http.StatusConflict, map[string]string{"detail": err.Error()})
+				return
+			}
+			if errors.Is(err, fs.ErrNotExist) {
+				s.writeJSON(w, http.StatusNotFound, map[string]string{"detail": "Event not found"})
 				return
 			}
 			if err != nil {

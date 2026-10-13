@@ -505,8 +505,16 @@ func (s *Supervisor) runOnce(ctx context.Context, run int) error {
 
 	processStarted := time.Now()
 	if err := cmd.Start(); err != nil {
-		s.setExit(StateFailed, "", err.Error())
-		return err
+		// Not terminal: the run loop retries start failures under the
+		// same quick-failure and crash budget as any other exit, and only
+		// it publishes StateFailed once retries are exhausted. Publishing
+		// it here made listeners tear down an event that a retry then
+		// brought back up. Record the reason so Status shows it meanwhile.
+		s.mu.Lock()
+		s.status.LastError = err.Error()
+		s.status.UpdatedAt = time.Now().UTC()
+		s.mu.Unlock()
+		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 
 	if s.pidFile != nil {

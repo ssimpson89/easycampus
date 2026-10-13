@@ -1,88 +1,144 @@
-# EasyCampus (Go)
+<p align="center">
+  <img src="docs/img/logo.svg" alt="EasyCampus" width="560">
+</p>
 
-EasyCampus is a self-hosted, two-node live video system for community meetings, classrooms, and small events — one machine encodes the local camera or capture card, a second machine on the same LAN decodes it on a TV or projector, and the encoder keeps a DVR cache so you can scroll back the moment somebody asks "what did she just say?" It's a sibling project to easystream (a separate repository): easystream schedules and broadcasts to cloud destinations like YouTube and RTMP, whereas easycampus-go pairs an encoder node with a decoder node on the same network and never has to talk to the public internet.
+<p align="center">
+  <strong>Put the camera in the back of the room on the screen at the front.</strong><br>
+  Live video for churches, classrooms, and community halls. No cloud, no accounts, no monthly bill.
+</p>
 
-If your job is "Sunday 10am, push to YouTube, walk away," use easystream. If your job is "encode the camera in the back of the hall and put it on the projector at the front of the hall, with a DVR scrubber for the volunteer at the back," this is the tool.
+---
 
-## Why use it
+EasyCampus turns two ordinary computers on the same network into a live video system. One computer sits by the camera and records. The other drives the projector or TV and plays the stream. Everything is recorded as it happens, so when someone asks "wait, what did she just say?" you can scroll back, replay it, and jump back to live.
 
-- **Encoder/decoder pairing on the same LAN.** Run the encoder on the machine with the camera or capture card, run the decoder on the machine driving the projector or TV, and they find each other by hostname. No cloud, no account, no NAT traversal.
-- **DVR cache for playback.** Every encoder session is segmented to disk on the encoder host and pulled by the decoder while the event runs. Late arrivals can join at the live edge or scrub back to the start of the meeting; recordings stick around after the stream ends.
-- **MPV-driven local display output.** The decoder uses MPV to drive a real display — full-screen on the projector, audio routed to the room PA, fade-to-black between sermons — instead of pretending a browser tab is a media player.
-- **Broadcast-grade quality tiers.** Four preset tiers cover consumer (church on a budget, 480p–1080p30), prosumer (1080p60 with hardware encoding), broadcast (true-CBR with Rec.709 / BT.2020 VUI baked into the SPS), and cinema (23.976 and 24.000 with closed GOP and `-fps_mode cfr`).
+<p align="center">
+  <img src="docs/img/encoder-live.png" alt="The EasyCampus encoder page while live: a red LIVE banner with a running timer, the event name, and the current quality, bitrate, and frame rate." width="900">
+  <br><em>The encoder page during a live event.</em>
+</p>
 
-## Quick start
+## What it does
 
-```bash
-go build -o easycampus ./cmd/easycampus
-./easycampus
-```
-
-Then open <http://127.0.0.1:8000> in your browser. The dashboard auto-redirects to `/encoder` or `/decoder` depending on which mode you've configured. The default port is `8000`; override with `EASYCAMPUS_PORT`. By default the server listens on all interfaces so the decoder on the other end of the LAN can reach it.
-
-Two environment variables you'll actually use:
-
-- `EASYCAMPUS_PORT=8000` — HTTP listen port.
-- `EASYCAMPUS_ALLOWED_ORIGINS=http://encoder.local:8000,http://projector.local:8000` — comma-separated CORS allow-list. The defaults already cover `http://127.0.0.1:<port>` and `http://localhost:<port>`; add the actual hostnames the other node browses to.
-
-Settings are layered: built-in defaults, then `~/.easycampus/config.yaml` (written with comments on first run), then `EASYCAMPUS_*` environment variables. See `internal/app/config.go` for the full env-var list (input device, HLS segment duration, adaptive bitrate, node type, etc.). Out-of-range values (port outside 1-65535, `hls_list_size` < 1, `hls_segment_duration` outside 1-10 s, `default_bitrate` below 100000 bits/s) are logged as warnings and replaced by the default. Unparseable env values (`EASYCAMPUS_PORT=eighty`) are ignored with a warning, so the file or default value stays in effect. `default_bitrate` is in bits per second (`4000000` = 4 Mbps).
-
-`./easycampus --set-type encoder|decoder` rewrites `node_type` in the config file and exits. It only touches that one key; environment overrides and derived paths are never written back.
-
-Logging has two independent knobs:
-
-- `LOG_LEVEL` (`debug|info|warn|error`, default `info`) and `LOG_FORMAT` (`json` default, or `text`) control the daemon's own structured log.
-- `EASYCAMPUS_LOG_LEVEL` / `log_level` in the config file (`debug|info|warning|error`, default `error`) is passed to FFmpeg as `-loglevel`. It does not affect the daemon log.
+- **Camera to screen over your own network.** Plug a webcam or capture card into one computer and a projector or TV into another. They talk over your building's Wi-Fi or Ethernet. Nothing goes to the internet.
+- **Rewind while you're live.** Every event is recorded as it streams. Scrub back to any moment, drop bookmarks on the parts that matter, then jump back to live with one click.
+- **Recordings that stick around.** When the event ends, the recording stays on disk. Play it back next week, or upload an existing video file to show it the same way.
+- **Real full-screen output.** The playback computer drives the projector directly, full-screen with sound, instead of relying on a browser tab someone might accidentally close.
+- **Lock it down.** The playback page has a lock button, so a curious visitor can't pause the service.
+- **Quality that fits your connection.** Pick a preset from 480p up to 4K. The defaults are tuned for volunteer-run rooms on ordinary hardware.
 
 ## What you'll need
 
-- A small machine for the encoder (Mac mini, a Linux box, a NUC) on the same network as the camera or capture card. A second machine for the decoder if you want local playback — Mac mini, Linux box, or anything with HDMI out and the same network. Both ends can also be the same box for testing.
-- **FFmpeg** installed and on `PATH`. `brew install ffmpeg` on macOS, `apt install ffmpeg` on Debian/Ubuntu, `dnf install ffmpeg` on Fedora.
-- **MPV** on the decoder host, if you want it to drive a local display. `brew install mpv` / `apt install mpv` / `dnf install mpv`. The encoder host doesn't need it.
-- **Go 1.25.6+** to build from source (see `go.mod`). The binary is single-file once compiled. Tagged releases publish macOS and Linux (amd64, arm64) `.tar.gz` archives. Windows is not supported for now.
+| Role | Hardware | Software |
+| --- | --- | --- |
+| **Encoder** (by the camera) | A Mac mini, small Linux box, or Windows PC with a webcam or capture card | [FFmpeg](https://ffmpeg.org/download.html) |
+| **Decoder** (by the screen) | Any computer with HDMI to the projector or TV | [FFmpeg](https://ffmpeg.org/download.html) and [mpv](https://mpv.io/installation/) |
 
-## Architecture
+Both computers need to be on the same network. For a quick test, one computer can play both roles.
 
-The codebase follows the `cmd/` + `internal/` layout. Each package owns one concern:
-
-- `internal/app` — `Server` struct, HTTP routes, handlers, middleware (panic recovery, restricted CORS, structured request logging), graceful shutdown.
-- `internal/ffmpeg` — FFmpeg supervisor, argv builder, child-process lifecycle. Owns the live encode.
-- `internal/devices` — device enumeration (USB cameras, capture cards, screens) with caching so the `/inputs` endpoint doesn't re-shell to `ffmpeg -list_devices` on every request.
-- `internal/quality` — the four-tier preset catalog (consumer / prosumer / broadcast / cinema), the recommender that filters by upload bandwidth and available hardware encoders, and the argv builder that emits color signalling and rate-control flags.
-- `internal/playback` — the decoder's mpv playback-profile catalog (`auto`, projector/TV cadences, Decklink) that drives `--video-sync`, `--interpolation`, `--display-fps-override`, `--hwdec` and `--vo`. See `docs/playback-profiles.md`.
-- `internal/atomicfile` — write-temp-then-rename helper. Used for event metadata, bookmark JSON, PID files and `config.yaml` so a crash mid-write can't truncate the file.
-- `internal/version` — build metadata (version, commit, date) injected via `-ldflags` by GoReleaser and reported at startup and in `/health`.
-- `internal/ui` — embedded `encoder.html` and `decoder.html` plus their assets, served via `//go:embed`. The binary is single-file deployable.
-
-For the architectural rationale and the refactor history that got us here, read `ARCHITECTURE_REVIEW.md`. Note it is a historical, pre-refactor review: the shared `livestream-core` library it proposes has not been extracted, and easycampus still carries its own `internal/ffmpeg`.
-
-## Quality presets
-
-EasyCampus exposes the same four-tier matrix easystream uses: **consumer** for volunteer-operated, residential-uplink installs; **prosumer** for 1080p60 with hardware encoders on a business connection; **broadcast** for true-CBR egress with broadcast-safe color limiters; **cinema** for 23.976 / 24.000 cadence preservation with closed GOP. Pick the tier that matches your install, pick the preset inside the tier that matches your upload bandwidth, and the recommender will tell you when you've picked something the network can't sustain. See `docs/quality-presets.md` for the full matrix, rate-control envelopes, color signalling, and per-tier caveats.
-
-Adaptive bitrate (step down on congestion, step back up when it clears) is opt-in via `EASYCAMPUS_ADAPTIVE_BITRATE=true`. It's off by default because the consumer tier is already conservative; broadcasters who want to ride a flaky uplink turn it on.
-
-## Routes
-
-The HTTP API is documented in [`ROUTES.md`](ROUTES.md). Most routes are registered under both a bare form (`/stream/start`) and an `/api/`-prefixed mirror (`/api/stream/start`) for compatibility with the original Python port's frontend. The exceptions (pages with no `/api` form, legacy `/api`-only aliases, and `/events` vs `/api/events`) are listed at the top of `ROUTES.md`.
-
-## Development
-
-A `Makefile` carries the common targets. `make help` prints the list:
+Installing the prerequisites:
 
 ```bash
-make build    # build ./bin/easycampus
-make run      # go run ./cmd/easycampus, honouring environment
-make test     # go test ./...
-make race     # go test -race -count=1 ./...
-make vet      # go vet ./...
-make lint     # gofmt -l . (fails if gofmt finds anything)
-make check    # lint + vet + race (the CI and release gate)
-make clean    # rm -rf bin/
+# macOS
+brew install ffmpeg mpv
+
+# Debian / Ubuntu
+sudo apt install ffmpeg mpv
+
+# Fedora
+sudo dnf install ffmpeg mpv
+
+# Windows
+winget install Gyan.FFmpeg
 ```
 
-`make build` drops the binary into `./bin/easycampus`. The root-level `/easycampus` path in `.gitignore` is retained for the legacy `go build -o easycampus` invocation; `./bin/` is gitignored too.
+## Getting started
+
+### 1. Download EasyCampus
+
+Grab the latest build for your computer from the [Releases page](https://github.com/ssimpson89/easycampus/releases). There are downloads for macOS and Linux, for both Intel and Apple Silicon / ARM. Unzip it and you'll find a single `easycampus` program. Do this on both computers. On Windows, build it from source using [docs/development.md](docs/development.md).
+
+### 2. Set up the encoder (the computer by the camera)
+
+Tell it that it's the encoder, then start it:
+
+```bash
+./easycampus --set-type encoder
+./easycampus
+```
+
+Open <http://localhost:8000> in a browser on that computer. You'll land on the encoder page. Give the event a name, pick your camera, choose a quality, and press **Start streaming**. The pre-flight checklist on the page tells you if anything is missing.
+
+### 3. Set up the decoder (the computer by the screen)
+
+A fresh install starts as a decoder, so just run it:
+
+```bash
+./easycampus
+```
+
+Open <http://localhost:8000> on that computer. Type the encoder's address into **Encoder address** (for example `http://encoder.local:8000` or `http://192.168.1.20:8000`) and press **Connect**. Pick the live event from the list, then press **Start projector** to send it full-screen to the display.
+
+<p align="center">
+  <img src="docs/img/decoder-live.png" alt="The EasyCampus decoder page connected to an encoder, showing a live Sunday Service event in the event list and an empty player waiting for selection." width="900">
+  <br><em>The decoder page, connected and showing a live event.</em>
+</p>
+
+### 4. Let the two computers talk
+
+The encoder only accepts control requests from web pages at addresses it trusts. This stops random websites from controlling it, but it isn't a password, so keep EasyCampus on a network you trust. If the decoder shows a "Couldn't reach" message that mentions `EASYCAMPUS_ALLOWED_ORIGINS`, start the encoder with the decoder's address added:
+
+```bash
+EASYCAMPUS_ALLOWED_ORIGINS=http://projector.local:8000 ./easycampus
+```
+
+Use whatever address you type into the decoder's browser to reach the decoder itself. Separate several addresses with commas. You can also save this permanently in the settings file below.
+
+## Everyday use
+
+- **Going live.** On the encoder, press **Start streaming**. A red LIVE banner with a timer appears across the top, and **Stop** is always in the corner.
+- **Rewinding.** Drag the scrubber on either page to go back. Press **Go to live** to catch up.
+- **Bookmarks.** Scrub to a key moment, like the start of the sermon, and press **Mark here**. Bookmarks made on the encoder show up on the decoder too, so the person at the screen can jump straight there.
+- **Locking the screen.** On the decoder, press the lock icon in the top corner to stop accidental clicks from pausing or seeking the projector.
+- **Playing a video file.** Use **Upload a video** to convert an MP4, MKV, or MOV and play it like any other event. The encoder can also pull a video from a web address with **Pull from URL**.
+- **Past events.** Everything you've streamed appears in the event list. Pick one to watch it again, or delete it when you no longer need it.
+
+## Settings
+
+EasyCampus works out of the box. If you want to change something, edit the settings file it creates on first run:
+
+- macOS and Linux: `~/.easycampus/config.yaml`
+- Windows: `%USERPROFILE%\.easycampus\config.yaml`
+
+The file has comments explaining each setting. The ones people usually change:
+
+| Setting | Environment variable | What it does |
+| --- | --- | --- |
+| `node_type` | `EASYCAMPUS_NODE_TYPE` | `encoder` or `decoder`. Easiest to change with `--set-type`. |
+| `port` | `EASYCAMPUS_PORT` | The web page port. Default `8000`. |
+| `allowed_origins` | `EASYCAMPUS_ALLOWED_ORIGINS` | Addresses allowed to control this computer, such as the decoder's. |
+| `default_encoder_url` | `EASYCAMPUS_DEFAULT_ENCODER_URL` | The encoder address the decoder fills in automatically. |
+
+Environment variables override the file, which is handy for trying something once.
+
+### Choosing a quality
+
+Pick the quality from the menu on the encoder page; it remembers your last choice in that browser. If you're not sure, start with **Consumer 1080p30**. It needs about 8.5 Mbps of network capacity between the two computers and looks good on most projectors. Drop to 720p if the picture stutters. The higher tiers (prosumer, broadcast, cinema) are for 60 fps sports, professional capture cards, and film-rate content. [Quality presets](docs/quality-presets.md) has the full list.
+
+## Troubleshooting
+
+**The decoder says it couldn't reach the encoder.** Check that the encoder is running and that you can open its address in the decoder's browser. Then add the decoder's address to the encoder's allowed origins, as described in step 4.
+
+**The encoder can't find my camera.** Press **Refresh devices**. On macOS, give your terminal app camera and microphone permission in System Settings, Privacy & Security. On Linux, make sure your user is in the `video` group.
+
+**The picture on the projector is choppy.** Try a lower quality preset, or use a wired network connection for both computers.
+
+**FFmpeg shows "Not detected" in the pre-flight check.** FFmpeg isn't installed or isn't on your `PATH`. Install it using the commands in [What you'll need](#what-youll-need), then restart EasyCampus.
+
+**Nothing appears on the projector.** Make sure mpv is installed on the decoder computer, and pick the right screen in the **Display** menu on the decoder page before starting the projector.
+
+## For developers
+
+Build instructions, the configuration reference, the package layout, and `make` targets are in [docs/development.md](docs/development.md). The HTTP API is in [ROUTES.md](ROUTES.md). Playback tuning for specific TVs and projectors is in [docs/playback-profiles.md](docs/playback-profiles.md).
 
 ## License
 
-No `LICENSE` file is currently committed to the repository. Treat this as "all rights reserved" until that's resolved — open an issue if you need a license decision before adopting.
+No license file is committed yet, so treat the code as all rights reserved for now. Open an issue if you need a license decision before adopting it.

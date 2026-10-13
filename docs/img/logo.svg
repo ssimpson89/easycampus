@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 180" width="760" height="180">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#fbbf24"/></linearGradient>
+  <filter id="glow" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur stdDeviation="5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+  <rect width="760" height="180" rx="28" fill="#0b1018"/>
+  <text x="56" y="100" font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="88" font-weight="800" fill="#e6edf3" letter-spacing="-3.5">Easy<tspan fill="#fbbf24">Campus</tspan></text>
+  <!-- scrubber spans the wordmark width -->
+  <rect x="60" y="126" width="640" height="10" rx="5" fill="#2a3443"/>
+  <rect x="60" y="126" width="470" height="10" rx="5" fill="url(#g)"/>
+  <g fill="#fbbf24"><path d="M190 121 l6 -10 l6 10 z"/><path d="M330 121 l6 -10 l6 10 z"/><path d="M450 121 l6 -10 l6 10 z"/></g>
+  <circle cx="530" cy="131" r="13" fill="#fbbf24" filter="url(#glow)"/>
+  <path d="M526 124 L537 131 L526 138 Z" fill="#0b1018"/>
+  <rect x="640" y="118" width="60" height="26" rx="13" fill="#c41010"/>
+  <circle cx="655" cy="131" r="4" fill="#fff"/>
+  <text x="664" y="136" font-family="Inter, Helvetica, Arial, sans-serif" font-size="13" font-weight="800" fill="#fff">LIVE</text>
+</svg>

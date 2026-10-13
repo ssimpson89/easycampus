@@ -137,23 +137,51 @@ func createEventDir(base string) (string, string, error) {
 }
 
 // keyedMutex hands out one mutex per key. Used to serialize
-// read-modify-write cycles on per-event files (bookmarks.json).
+// read-modify-write cycles on per-event files (bookmarks.json) and event
+// deletion. Entries are reference-counted and removed once the holder and
+// every waiter have released, so the map only holds keys in active use
+// (event IDs are unique, so a never-shrinking map would grow forever).
 type keyedMutex struct {
 	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	locks map[string]*keyedEntry
+}
+
+type keyedEntry struct {
+	mu   sync.Mutex
+	refs int // holder + waiters; guarded by keyedMutex.mu
 }
 
 func (k *keyedMutex) lock(key string) func() {
 	k.mu.Lock()
 	if k.locks == nil {
-		k.locks = make(map[string]*sync.Mutex)
+		k.locks = make(map[string]*keyedEntry)
 	}
-	m, ok := k.locks[key]
+	e, ok := k.locks[key]
 	if !ok {
-		m = &sync.Mutex{}
-		k.locks[key] = m
+		e = &keyedEntry{}
+		k.locks[key] = e
 	}
+	e.refs++
 	k.mu.Unlock()
-	m.Lock()
-	return m.Unlock
+
+	e.mu.Lock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			e.mu.Unlock()
+			k.mu.Lock()
+			e.refs--
+			if e.refs == 0 {
+				delete(k.locks, key)
+			}
+			k.mu.Unlock()
+		})
+	}
+}
+
+// size reports how many keys are currently tracked. Used by tests.
+func (k *keyedMutex) size() int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return len(k.locks)
 }

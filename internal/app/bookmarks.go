@@ -35,6 +35,12 @@ func writeBookmarks(settings AppSettings, eventID string, bookmarks []Bookmark) 
 	if err != nil {
 		return err
 	}
+	// atomicfile.Write creates missing directories, so check the event
+	// still exists first; otherwise a bookmark write racing an event
+	// delete would resurrect the deleted directory.
+	if _, err := os.Stat(filepath.Dir(bookmarksPath)); err != nil {
+		return err
+	}
 	// Atomic write — concurrent POST + DELETE on the same event's
 	// bookmark list would otherwise race and yield a truncated file
 	// that subsequent reads silently parse as zero bookmarks.

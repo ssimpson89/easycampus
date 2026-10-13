@@ -6,7 +6,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -224,5 +226,75 @@ exit 1
 		if strings.Contains(log, "SECRET") {
 			t.Fatalf("credential leaked to job log")
 		}
+	}
+}
+
+// TestSupervisorStartFailureIsNotTerminal: a failed exec (binary missing)
+// must not publish StateFailed while the run loop still intends to
+// retry. Here the binary appears before the retry, so the stream must
+// come up and StateFailed must never be observed.
+func TestSupervisorStartFailureIsNotTerminal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fake ffmpeg is unix-only")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "ffmpeg") // does not exist yet
+	script := "#!/bin/sh\ni=0\nwhile [ $i -lt 300 ]; do i=$((i+1)); printf 'frame=%d\\nout_time_us=%d\\nprogress=continue\\n' $i $i; sleep 0.05; done\n"
+
+	s := NewSupervisor(quietLogger(), SupervisorConfig{RestartInitialDelay: 50 * time.Millisecond})
+	var mu sync.Mutex
+	var states []State
+	created := false
+	s.SetOnStateChange(func() {
+		st := s.Status().State
+		mu.Lock()
+		defer mu.Unlock()
+		states = append(states, st)
+		// Install the binary once the first start has failed, before
+		// the retry runs.
+		if st == StateRestarting && !created {
+			created = true
+			if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+				t.Errorf("write fake ffmpeg: %v", err)
+			}
+		}
+	})
+	cfg := liveCfg(testPreset, EncoderX264)
+	cfg.Binary = bin
+	cfg.OutputDir = dir
+	if err := s.Start(cfg, "event-retry"); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+
+	waitFor(t, "running after retry", 5*time.Second, func() bool {
+		return s.Status().State == StateRunning && s.Status().LastProgress.Frame > 0
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	for _, st := range states {
+		if st == StateFailed {
+			t.Fatalf("StateFailed published for a retried start failure; states=%v", states)
+		}
+	}
+	if !created {
+		t.Fatalf("expected a restarting transition after the failed start; states=%v", states)
+	}
+}
+
+// TestSupervisorStartFailureExhaustsToFailed: when every start fails,
+// the run loop still ends in StateFailed with the exec error recorded.
+func TestSupervisorStartFailureExhaustsToFailed(t *testing.T) {
+	s := NewSupervisor(quietLogger(), SupervisorConfig{RestartInitialDelay: 10 * time.Millisecond})
+	cfg := liveCfg(testPreset, EncoderX264)
+	cfg.Binary = filepath.Join(t.TempDir(), "missing-ffmpeg")
+	cfg.OutputDir = t.TempDir()
+	if err := s.Start(cfg, "event-dead"); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	waitFor(t, "failed", 5*time.Second, func() bool { return s.Status().State == StateFailed })
+	if s.Status().LastExit == "" {
+		t.Errorf("LastExit empty; want the exec error")
 	}
 }

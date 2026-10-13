@@ -534,11 +534,23 @@ func (s *Server) reconcileJobStatus(info *EventInfoFile, eventDir, infoPath stri
 		return
 	}
 	status := "failed"
-	if _, err := os.Stat(filepath.Join(eventDir, "master.m3u8")); err == nil {
+	if playlistFinalized(filepath.Join(eventDir, "master.m3u8")) {
 		status = "completed"
 	}
 	updateInfoStatus(infoPath, status, 0)
 	info.Status = status
+}
+
+// playlistFinalized reports whether an HLS playlist has been closed with
+// #EXT-X-ENDLIST. A VOD conversion writes master.m3u8 long before FFmpeg
+// finishes, so mere existence doesn't mean the job succeeded; FFmpeg only
+// appends ENDLIST when it completes the output.
+func playlistFinalized(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), "#EXT-X-ENDLIST")
 }
 
 // infoMu serializes read-modify-write cycles on info.json files. Job

@@ -121,10 +121,10 @@ func TestRedactStreamKey(t *testing.T) {
 			want: "rtmp://example/live2/somekey",
 		},
 		{
-			name: "short key skips redaction",
+			name: "short key is still redacted",
 			line: "the abc rtmp://thing",
 			key:  "abc",
-			want: "the abc rtmp://thing",
+			want: "the <redacted> rtmp://thing",
 		},
 		{
 			name: "multiple occurrences",

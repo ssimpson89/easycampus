@@ -116,7 +116,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	filename := uploadFilename(header.Filename)
 
-	inputPath := filepath.Join(eventDir, filename)
+	inputPath := filepath.Join(eventDir, uploadSourceName(filename))
 	if err := saveMultipartFile(file, inputPath); err != nil {
 		_ = os.RemoveAll(eventDir)
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
@@ -217,7 +217,7 @@ func (s *Server) handleCacheUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	filename := uploadFilename(header.Filename)
 
-	inputPath := filepath.Join(eventDir, filename)
+	inputPath := filepath.Join(eventDir, uploadSourceName(filename))
 	if err := saveMultipartFile(file, inputPath); err != nil {
 		_ = os.RemoveAll(eventDir)
 		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
@@ -516,6 +516,22 @@ func recordInfoPID(infoPath string, pid int) {
 		return
 	}
 	_ = atomicfile.Write(infoPath, updated, 0644)
+}
+
+// uploadSourceName is the on-disk name for an uploaded source file. It
+// is generated rather than client-chosen so an upload can never collide
+// with files the pipeline writes into the same directory (info.json,
+// ffmpeg.log, master.m3u8, init/segment files). Only a short
+// alphanumeric extension is kept so FFmpeg can still probe by suffix;
+// the original filename is kept as metadata in info.json.
+func uploadSourceName(original string) string {
+	ext := strings.TrimPrefix(filepath.Ext(original), ".")
+	if ext == "" || len(ext) > 8 || strings.IndexFunc(ext, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9')
+	}) >= 0 {
+		return "source.upload"
+	}
+	return "source." + strings.ToLower(ext)
 }
 
 // uploadFilename reduces a client-supplied multipart filename to a safe

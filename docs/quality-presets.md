@@ -134,13 +134,11 @@ on low-motion content — the broadcast tier wants the encoder that hits
 the declared rate to the bit.
 
 **Broadcast-safe limiter:** the `BroadcastSafe` flag on every broadcast
-preset tells the supervisor to insert a limiter that clamps to 16..235
-before encode (currently `-vf limiter=min=16:max=235`). Note on chroma:
-ffmpeg's `limiter` applies the same bounds to every plane by default,
-so chroma is also clamped to 16..235 today rather than the Rec.709
-chroma range of 16..240. That filter may be refined to treat chroma
-separately; check `internal/ffmpeg/config.go` for the current form. A
-source with
+preset tells the supervisor to insert limiters before encode: luma is
+clamped to 16..235 (`limiter=min=16:max=235:planes=1`) and chroma to
+the Rec.709 range of 16..240 (`limiter=min=16:max=240:planes=6`). The
+bounds are scaled up for 10-bit sources. See `internal/ffmpeg/config.go`
+for the exact filter chain. A source with
 out-of-range whites (a confidence monitor passing through PC-range
 graphics, a Decklink card pumping PC range) won't trip downstream QC
 systems.

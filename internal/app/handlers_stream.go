@@ -136,7 +136,17 @@ func (s *Server) handleStreamForceStop(w http.ResponseWriter, r *http.Request) {
 	// Force-stop is a teardown path; detach from the request ctx so a
 	// client disconnect doesn't leave the supervisor half-killed.
 	killCtx := context.WithoutCancel(r.Context())
+	// Capture the live event before killing: if this PID is the live
+	// encoder, its info.json must leave "running" just like a normal
+	// stop, or the event shows as live until the next restart.
+	liveEventID := ""
+	if s.ffmpeg.IsRunning() && s.ffmpeg.GetStatus(r.Context()).FFMpegPID == req.PID {
+		liveEventID = s.ffmpeg.CurrentEventID()
+	}
 	killed, err := s.ffmpeg.ForceKillPID(killCtx, req.PID)
+	if killed && liveEventID != "" {
+		updateInfoStatus(filepath.Join(s.settings.EventsDir, liveEventID, "info.json"), "completed", 0)
+	}
 	if errors.Is(err, errPIDNotTracked) {
 		s.logger.Warn("force stop refused: untracked pid", "pid", req.PID)
 		s.writeJSON(w, http.StatusForbidden, map[string]string{"detail": err.Error()})

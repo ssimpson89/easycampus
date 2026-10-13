@@ -17,17 +17,16 @@ builds:
     flags:
       - -trimpath
     mod_timestamp: "{{ .CommitTimestamp }}"
+    # Windows is not released yet: the decoder's mpv control uses a
+    # unix socket, and mpv on Windows only speaks named pipes, so
+    # projector output can't work there. The encoder does build and run
+    # on Windows from source (GOOS=windows go build ./cmd/easycampus).
     goos:
       - darwin
       - linux
-      - windows
     goarch:
       - amd64
       - arm64
-    # Windows ships amd64 only.
-    ignore:
-      - goos: windows
-        goarch: arm64
     ldflags:
       - >-
         -s -w
@@ -41,10 +40,6 @@ archives:
       - easycampus
     formats:
       - tar.gz
-    format_overrides:
-      - goos: windows
-        formats:
-          - zip
     name_template: >-
       {{ .ProjectName }}_
       {{- .Version }}_

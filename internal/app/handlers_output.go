@@ -300,7 +300,9 @@ func (s *Server) handlePlaybackProfiles(w http.ResponseWriter, r *http.Request) 
 	// Resolve to a known id — if the stored value is stale (e.g. a
 	// profile was removed in an upgrade), fall back to the canonical
 	// default so the UI doesn't render a missing selection.
-	if _, ok := playback.ByID(def); !ok {
+	// Unavailable profiles are omitted from playback.All(), so they
+	// must not be offered as the default either.
+	if _, err := playback.ByIDAvailable(def); err != nil {
 		def = playback.DefaultID
 	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{

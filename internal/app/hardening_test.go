@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"easycampus/internal/playback"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -121,9 +122,10 @@ func TestCacheDeleteEmptyOrInvalidID(t *testing.T) {
 	}
 }
 
-// TestCacheLoopSkipsUnsafeSegments feeds a playlist with a traversal
-// segment name and checks only the safe segment is written, inside the
-// event's cache dir, and that the playlist lands after it.
+// TestCacheLoopSkipsUnsafeSegments feeds a playlist with traversal
+// segment names. The safe segment is downloaded inside the event's
+// cache dir, nothing is written outside it, and the playlist itself is
+// never published because it references segments we refused to fetch.
 func TestCacheLoopSkipsUnsafeSegments(t *testing.T) {
 	outside := t.TempDir()
 	evil := filepath.Join(outside, "evil.ts")
@@ -144,23 +146,109 @@ func TestCacheLoopSkipsUnsafeSegments(t *testing.T) {
 	}
 	defer svc.StopAll()
 
-	playlist := filepath.Join(svc.settings.CacheDir, "evt1", "master.m3u8")
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if _, err := os.Stat(playlist); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("playlist never written")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	// Playlist is written after segments, so ok.ts must already exist.
-	if _, err := os.Stat(filepath.Join(svc.settings.CacheDir, "evt1", "ok.ts")); err != nil {
-		t.Errorf("ok.ts missing when playlist present: %v", err)
+	dir := filepath.Join(svc.settings.CacheDir, "evt1")
+	waitForFile(t, filepath.Join(dir, "ok.ts"), 3*time.Second)
+	// Give the loop a beat past the download to (wrongly) publish.
+	time.Sleep(200 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(dir, "master.m3u8")); err == nil {
+		t.Error("playlist published despite referencing unsafe segments")
 	}
 	if _, err := os.Stat(evil); err == nil {
 		t.Errorf("traversal segment written outside cache dir: %s", evil)
+	}
+}
+
+// TestCacheLoopHoldsPlaylistUntilSegmentsPresent checks a playlist is
+// not published while one of its segments fails to download, and is
+// published once the segment becomes available.
+func TestCacheLoopHoldsPlaylistUntilSegmentsPresent(t *testing.T) {
+	var mu sync.Mutex
+	failing := true
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/master.m3u8"):
+			fmt.Fprint(w, "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"720@0\"\n#EXTINF:2,\na.m4s\n#EXTINF:2,\nb.m4s\n")
+		case strings.HasSuffix(r.URL.Path, "/b.m4s"):
+			mu.Lock()
+			f := failing
+			mu.Unlock()
+			if f {
+				http.Error(w, "not yet", http.StatusNotFound)
+				return
+			}
+			_, _ = w.Write([]byte("segment"))
+		default:
+			_, _ = w.Write([]byte("segment"))
+		}
+	}))
+	defer peer.Close()
+
+	svc := newTestCacheService(t)
+	if err := svc.StartCaching(context.Background(), "evt2", peer.URL); err != nil {
+		t.Fatalf("StartCaching: %v", err)
+	}
+	defer svc.StopAll()
+
+	dir := filepath.Join(svc.settings.CacheDir, "evt2")
+	playlist := filepath.Join(dir, "master.m3u8")
+	waitForFile(t, filepath.Join(dir, "init.mp4"), 3*time.Second)
+	waitForFile(t, filepath.Join(dir, "a.m4s"), 3*time.Second)
+	time.Sleep(200 * time.Millisecond)
+	if _, err := os.Stat(playlist); err == nil {
+		t.Fatal("playlist published while b.m4s was missing")
+	}
+
+	mu.Lock()
+	failing = false
+	mu.Unlock()
+	waitForFile(t, playlist, 10*time.Second)
+	if _, err := os.Stat(filepath.Join(dir, "b.m4s")); err != nil {
+		t.Errorf("b.m4s missing when playlist present: %v", err)
+	}
+}
+
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never written", filepath.Base(path))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestM3U8Attr(t *testing.T) {
+	cases := []struct{ line, name, want string }{
+		{`#EXT-X-MAP:URI="init.mp4"`, "URI", "init.mp4"},
+		{`#EXT-X-MAP:URI="init-r2.mp4",BYTERANGE="720@0"`, "URI", "init-r2.mp4"},
+		{`#EXT-X-MAP:BYTERANGE="720@0",URI="x.mp4"`, "URI", "x.mp4"},
+		{`#EXT-X-MAP:BYTERANGE=720@0`, "URI", ""},
+	}
+	for _, c := range cases {
+		if got := m3u8Attr(c.line, c.name); got != c.want {
+			t.Errorf("m3u8Attr(%q) = %q, want %q", c.line, got, c.want)
+		}
+	}
+}
+
+func TestUploadSourceName(t *testing.T) {
+	cases := map[string]string{
+		"sermon.MP4":      "source.mp4",
+		"ffmpeg.log":      "source.log",
+		"master.m3u8":     "source.m3u8",
+		"info.json":       "source.json",
+		"noext":           "source.upload",
+		"weird.ex$t":      "source.upload",
+		"long.abcdefghij": "source.upload",
+	}
+	for in, want := range cases {
+		if got := uploadSourceName(in); got != want {
+			t.Errorf("uploadSourceName(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
@@ -359,5 +447,26 @@ func TestShutdownForceClosesIdleConns(t *testing.T) {
 	case <-served:
 	case <-time.After(2 * time.Second):
 		t.Error("ListenAndServe did not return after Shutdown")
+	}
+}
+
+// TestPlaybackProfilesDefaultSkipsUnavailable checks a stored profile
+// that is unavailable (and so absent from the list) is not offered as
+// the default, which would leave the UI's select out of sync.
+func TestPlaybackProfilesDefaultSkipsUnavailable(t *testing.T) {
+	s := newTestServerNoListener(t)
+	s.setPlaybackProfile("decklink-broadcast")
+	w := serve(s, http.MethodGet, "/playback-profiles", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Default string `json:"default"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Default != playback.DefaultID {
+		t.Errorf("default=%q, want %q", resp.Default, playback.DefaultID)
 	}
 }

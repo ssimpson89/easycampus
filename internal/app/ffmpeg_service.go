@@ -212,6 +212,48 @@ func (f *FFmpegService) CancelJob(pid int) bool {
 	return true
 }
 
+// CancelJobAndWait cancels the tracked job with the given PID and
+// blocks until it exits or ctx is done. Returns false when pid is not a
+// live tracked job. Callers that delete a job's directory use this so
+// FFmpeg isn't still holding (or writing into) files being removed.
+func (f *FFmpegService) CancelJobAndWait(ctx context.Context, pid int) bool {
+	f.mu.Lock()
+	job, ok := f.jobs[pid]
+	f.mu.Unlock()
+	if !ok || job.IsFinished() {
+		return false
+	}
+	job.Cancel()
+	select {
+	case <-job.Done():
+	case <-ctx.Done():
+	}
+	return true
+}
+
+// StopAllJobs cancels every tracked upload/external job and waits for
+// them to exit or for ctx to expire. Called from Server.Shutdown so
+// conversions don't outlive the daemon (macOS and Windows have no
+// parent-death signal to catch them).
+func (f *FFmpegService) StopAllJobs(ctx context.Context) {
+	f.mu.Lock()
+	jobs := make([]*ocffmpeg.Job, 0, len(f.jobs))
+	for _, j := range f.jobs {
+		jobs = append(jobs, j)
+	}
+	f.mu.Unlock()
+	for _, j := range jobs {
+		j.Cancel()
+	}
+	for _, j := range jobs {
+		select {
+		case <-j.Done():
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // JobRunning reports whether pid is a tracked, still-running job.
 func (f *FFmpegService) JobRunning(pid int) bool {
 	f.mu.Lock()

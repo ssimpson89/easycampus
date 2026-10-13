@@ -228,6 +228,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.cache.StopAll()
 	s.logger.Info("shutdown: cache loops stopped")
 
+	// Upload / external-source conversions are separate FFmpeg
+	// processes; stop them so none outlive the daemon.
+	s.ffmpeg.StopAllJobs(ctx)
+	s.logger.Info("shutdown: conversion jobs stopped")
+
 	// Stop the adaptive controller BEFORE the supervisor it watches.
 	// The controller's tick goroutine reads supervisor status and may
 	// call sup.Stop/Start to step quality; if we tore the supervisor

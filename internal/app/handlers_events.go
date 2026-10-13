@@ -1,12 +1,14 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
 	"strings"
+	"time"
 )
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -38,7 +40,14 @@ func (s *Server) handleEventDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	// Only PIDs of jobs this process launched are killed; a PID read
 	// from info.json may belong to an unrelated process after a restart.
-	err := deleteEvent(s.settings, eventID, func(pid int) { s.ffmpeg.CancelJob(pid) })
+	// Wait (bounded) for a cancelled job to exit before its directory is
+	// removed, so FFmpeg isn't writing into an unlinked dir and Windows
+	// doesn't refuse to delete files it still holds open.
+	err := deleteEvent(s.settings, eventID, func(pid int) {
+		waitCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		s.ffmpeg.CancelJobAndWait(waitCtx, pid)
+	})
 	if errors.Is(err, fs.ErrNotExist) {
 		s.writeJSON(w, http.StatusNotFound, map[string]string{"detail": "Event not found"})
 		return

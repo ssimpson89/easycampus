@@ -225,6 +225,9 @@ func (c *CacheService) downloadLoop(ctx context.Context, eventID, baseURL, outpu
 
 			segments := parseSegments(content)
 			newDownloads := 0
+			// complete stays true only if every segment the playlist
+			// references is a safe name and is on disk locally.
+			complete := true
 			for _, segment := range segments {
 				if downloaded[segment] {
 					continue
@@ -234,7 +237,7 @@ func (c *CacheService) downloadLoop(ctx context.Context, eventID, baseURL, outpu
 				if !safeSegmentName(segment) {
 					c.logger.Warn("cache: skipping unsafe segment name",
 						"event_id", eventID, "segment", segment)
-					downloaded[segment] = true
+					complete = false
 					continue
 				}
 				// Cheap pre-check: if Stop landed mid-batch we'd
@@ -247,20 +250,29 @@ func (c *CacheService) downloadLoop(ctx context.Context, eventID, baseURL, outpu
 				if err := c.downloadFile(ctx, url, filepath.Join(outputDir, segment)); err == nil {
 					downloaded[segment] = true
 					newDownloads++
+				} else {
+					complete = false
 				}
 			}
 
-			// Write the playlist only after its segments so a reader
-			// never sees a playlist entry whose file isn't on disk yet.
-			// Atomic so readers never see a half-written playlist.
-			if werr := atomicfile.Write(
-				filepath.Join(outputDir, "master.m3u8"),
-				[]byte(content), 0644); werr != nil {
-				c.logger.Warn("cache: playlist write failed",
-					"event_id", eventID, "err", werr)
+			// Publish the playlist only when every segment it lists is
+			// on disk, so a reader never requests a file that failed to
+			// download or was rejected as unsafe. Otherwise keep the
+			// previous playlist and retry on the next cycle. Atomic so
+			// readers never see a half-written playlist.
+			if complete {
+				if werr := atomicfile.Write(
+					filepath.Join(outputDir, "master.m3u8"),
+					[]byte(content), 0644); werr != nil {
+					c.logger.Warn("cache: playlist write failed",
+						"event_id", eventID, "err", werr)
+				}
+			} else {
+				c.logger.Warn("cache: playlist held back; some segments missing or unsafe",
+					"event_id", eventID)
 			}
 
-			if !isLive && newDownloads == 0 {
+			if !isLive && complete && newDownloads == 0 {
 				completeCycles++
 				if completeCycles >= 2 {
 					// VOD source has stabilised: nothing new for two
@@ -348,11 +360,9 @@ func parseSegments(content string) []string {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "#EXT-X-MAP:URI=") {
-			parts := strings.Split(line, "URI=")
-			if len(parts) == 2 {
-				segment := strings.Trim(parts[1], "\"")
-				segments = append(segments, segment)
+		if strings.HasPrefix(line, "#EXT-X-MAP:") {
+			if uri := m3u8Attr(line, "URI"); uri != "" {
+				segments = append(segments, uri)
 			}
 			continue
 		}
@@ -362,4 +372,43 @@ func parseSegments(content string) []string {
 		segments = append(segments, line)
 	}
 	return segments
+}
+
+// m3u8Attr returns the value of a quoted or bare attribute in an HLS
+// tag line, e.g. URI from `#EXT-X-MAP:URI="init.mp4",BYTERANGE="..."`.
+func m3u8Attr(line, name string) string {
+	i := strings.Index(line, ":")
+	if i < 0 {
+		return ""
+	}
+	rest := line[i+1:]
+	for rest != "" {
+		eq := strings.Index(rest, "=")
+		if eq < 0 {
+			return ""
+		}
+		key := strings.TrimSpace(rest[:eq])
+		rest = rest[eq+1:]
+		var val string
+		if strings.HasPrefix(rest, "\"") {
+			end := strings.Index(rest[1:], "\"")
+			if end < 0 {
+				return ""
+			}
+			val = rest[1 : end+1]
+			rest = rest[end+2:]
+		} else {
+			end := strings.Index(rest, ",")
+			if end < 0 {
+				end = len(rest)
+			}
+			val = rest[:end]
+			rest = rest[end:]
+		}
+		rest = strings.TrimPrefix(rest, ",")
+		if key == name {
+			return val
+		}
+	}
+	return ""
 }

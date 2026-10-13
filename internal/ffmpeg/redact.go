@@ -133,11 +133,12 @@ func RedactURLsInLog(line string) string {
 }
 
 // redactStreamKey replaces a stream key in a log line with <redacted>.
-// Skipped when the key is empty or shorter than 8 characters (those are
-// almost certainly not a real key — refusing to redact "abc" prevents
-// matching common words and leaking surrounding context).
+// Every non-empty key is redacted: it was supplied explicitly as a
+// credential, so its length says nothing about whether it is secret.
+// Over-redacting a short key that also appears in ordinary text is the
+// safe failure mode.
 func redactStreamKey(line, key string) string {
-	if key == "" || len(key) < 8 {
+	if key == "" {
 		return line
 	}
 	if !strings.Contains(line, key) {

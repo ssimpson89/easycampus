@@ -39,17 +39,23 @@
         <h1>EasyCampus <span class="brand-sub">Decoder</span></h1>
       </div>
       <div class="topbar-right">
+        <span class="pill" x-show="nodeType" x-cloak x-text="'Node: ' + nodeType"
+              title="NODE_TYPE reported by this server"></span>
         <span class="conn-pill" :class="isConnected ? 'ok' : 'idle'"
               x-text="isConnected ? 'Encoder connected' : 'No encoder'"></span>
         <span class="pill live" x-show="hardwareActive" x-cloak>Projector</span>
         <button class="icon-btn" :class="{ on: locked }" @click="toggleLock()"
                 :title="locked ? 'Unlock controls' : 'Lock controls'"
-                :aria-label="locked ? 'Unlock controls' : 'Lock controls'">
+                aria-label="Lock controls" :aria-pressed="locked">
           <svg x-show="!locked" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 11V7a4 4 0 10-8 0M5 11h14v10H5z"/></svg>
           <svg x-show="locked"  width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 11V7a4 4 0 118 0v4M5 11h14v10H5z"/></svg>
         </button>
       </div>
     </header>
+
+    <!-- =============== STATUS (neutral progress, not an error) =============== -->
+    <p class="status-line" role="status" aria-live="polite" x-show="statusLine" x-cloak x-text="statusLine"
+       style="margin-bottom: 16px;"></p>
 
     <!-- =============== ERROR =============== -->
     <div class="panel" x-show="error" x-cloak
@@ -65,7 +71,7 @@
     <div class="grid-3-2" style="margin-bottom: 20px;">
 
       <!-- ===== LEFT COLUMN: Connection / Events / Upload / Hardware ===== -->
-      <div class="stack">
+      <div class="stack controls-col">
 
         <!-- Connect to encoder -->
         <section class="panel">
@@ -79,10 +85,14 @@
                    @keydown.enter.prevent="!locked && discoverEvents()">
             <button class="button" @click="discoverEvents()"
                     :disabled="isDiscovering || locked">
-              <span x-show="!isDiscovering">Scan</span>
-              <span x-show="isDiscovering">Scanning…</span>
+              <span x-show="!isDiscovering">Connect</span>
+              <span x-show="isDiscovering">Connecting…</span>
             </button>
           </div>
+          <p class="field-help warn" x-show="connectHint" x-cloak x-text="connectHint"></p>
+          <p class="field-help warn" x-show="remoteIsDecoder" x-cloak>
+            This address points at a decoder, not an encoder. Enter the encoder's address; local caches were left untouched.
+          </p>
 
           <hr class="divider">
 
@@ -91,7 +101,7 @@
             <input id="manual-url" type="text" x-model="streamUrl" class="mono"
                    placeholder="http://…/master.m3u8" :disabled="locked"
                    @keydown.enter.prevent="!locked && connectManualStream()">
-            <button class="button button-primary" @click="connectManualStream()" :disabled="locked || !streamUrl">Connect</button>
+            <button class="button button-primary" @click="connectManualStream()" :disabled="locked || !streamUrl">Play URL</button>
           </div>
         </section>
 
@@ -102,15 +112,38 @@
             <button class="button button-sm" @click="discoverEvents()" :disabled="locked || isDiscovering">Refresh</button>
           </div>
 
+          <div class="panel-sub" x-show="staleCaches.length > 0" x-cloak style="margin-bottom: 12px;">
+            <div class="row-between">
+              <span class="hint">
+                <span x-text="staleCaches.length"></span>
+                <span x-text="staleCaches.length === 1 ? 'local cache is' : 'local caches are'"></span>
+                for events the encoder no longer lists.
+              </span>
+              <button class="button button-sm button-danger" @click="clearStaleCaches()"
+                      :disabled="locked || isClearingStale">
+                <span x-show="!isClearingStale">Clear stale caches</span>
+                <span x-show="isClearingStale">Clearing…</span>
+              </button>
+            </div>
+            <ul class="stale-list">
+              <template x-for="id in staleCaches" :key="id">
+                <li class="mono" x-text="id"></li>
+              </template>
+            </ul>
+          </div>
+
           <div class="empty-card" x-show="allEvents.length === 0" x-cloak>
             <p>No events yet</p>
-            <p class="hint">Scan an encoder, or upload a video below.</p>
+            <p class="hint">Connect to an encoder, or upload a video below.</p>
           </div>
 
           <div class="event-list" x-show="allEvents.length > 0" x-cloak>
             <template x-for="ev in allEvents" :key="ev.id">
-              <div class="event-card">
-                <button class="event-card-body" @click="selectEvent(ev)" :disabled="locked">
+              <div class="event-card" :class="{ active: activeCacheEventId === ev.id }">
+                <button class="event-card-body" @click="selectEvent(ev)"
+                        :disabled="locked || !!selectingEventId"
+                        :aria-busy="selectingEventId === ev.id ? 'true' : null"
+                        :aria-current="activeCacheEventId === ev.id ? 'true' : null">
                   <span class="event-card-icon" :class="eventIcon(ev)">
                     <svg x-show="eventIcon(ev) === 'recording'" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>
                     <svg x-show="eventIcon(ev) === 'upload'"   width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
@@ -134,7 +167,7 @@
                 <span class="event-card-actions">
                   <button class="icon-btn" @click="deleteCache(ev)" :disabled="locked"
                           :title="ev.type === 'local_upload' ? 'Delete local upload' : 'Clear local cache'"
-                          :aria-label="ev.type === 'local_upload' ? 'Delete local upload' : 'Clear local cache'">
+                          :aria-label="(ev.type === 'local_upload' ? 'Delete local upload ' : 'Clear local cache for ') + ev.name">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
                       <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m2 0v14a2 2 0 01-2 2H8a2 2 0 01-2-2V6"/>
                     </svg>
@@ -155,9 +188,9 @@
                  @change="onFileChosen($event)">
 
           <label for="upload-quality">Target quality</label>
-          <select id="upload-quality" x-model="uploadQuality" :disabled="locked || isUploading">
+          <select id="upload-quality" x-ref="uploadQualitySelect" x-model="uploadQuality" :disabled="locked || isUploading">
             <template x-for="p in uploadPresets" :key="p.id">
-              <option :value="p.id" x-text="p.label"></option>
+              <option :value="p.id" x-text="p.label" :selected="p.id === uploadQuality"></option>
             </template>
           </select>
 
@@ -202,17 +235,17 @@
             </div>
             <div x-show="outputMode === 'display'">
               <label for="screen-idx">Display</label>
-              <select id="screen-idx" x-model.number="screenIndex" :disabled="hardwareActive || locked">
+              <select id="screen-idx" x-ref="screenSelect" x-model.number="screenIndex" :disabled="hardwareActive || locked">
                 <template x-for="d in capabilities.displays" :key="d.index">
-                  <option :value="d.index" x-text="formatDisplayOption(d)"></option>
+                  <option :value="d.index" x-text="formatDisplayOption(d)" :selected="d.index === screenIndex"></option>
                 </template>
               </select>
             </div>
             <div x-show="outputMode === 'decklink'">
               <label for="dl-fmt">DeckLink format</label>
-              <select id="dl-fmt" x-model="decklinkFormat" :disabled="hardwareActive || locked">
+              <select id="dl-fmt" x-ref="decklinkSelect" x-model="decklinkFormat" :disabled="hardwareActive || locked">
                 <template x-for="f in capabilities.decklink.formats" :key="f">
-                  <option :value="f" x-text="f"></option>
+                  <option :value="f" x-text="f" :selected="f === decklinkFormat"></option>
                 </template>
               </select>
             </div>
@@ -228,18 +261,21 @@
 
           <div style="margin-top: 12px;">
             <label for="playback-profile">Playback profile</label>
-            <select id="playback-profile" x-model="playbackProfile" :disabled="hardwareActive || locked">
+            <select id="playback-profile" x-ref="profileSelect" x-model="playbackProfile" :disabled="hardwareActive || locked">
               <template x-for="p in playbackProfiles" :key="p.id">
-                <option :value="p.id" :title="p.description" x-text="p.label"></option>
+                <option :value="p.id" :title="p.description" x-text="p.label" :selected="p.id === playbackProfile"></option>
               </template>
             </select>
             <p class="row-hint" x-text="playbackProfileDescription()" style="margin-top: 4px;"></p>
           </div>
 
           <div class="form-actions">
-            <button class="button button-primary" @click="toggleHardware()" :disabled="locked || (!hardwareActive && !streamUrl)">
-              <span x-show="!hardwareActive">Start projector</span>
-              <span x-show="hardwareActive">Stop projector</span>
+            <button class="button button-primary" @click="toggleHardware()"
+                    :disabled="locked || isTogglingHardware || (!hardwareActive && !streamUrl)"
+                    :aria-busy="isTogglingHardware ? 'true' : null">
+              <span x-show="!hardwareActive && !isTogglingHardware">Start projector</span>
+              <span x-show="hardwareActive && !isTogglingHardware">Stop projector</span>
+              <span x-show="isTogglingHardware" x-text="hardwareActive ? 'Stopping…' : 'Starting…'"></span>
             </button>
             <span class="hint" x-show="!streamUrl && !hardwareActive">Pick an event first.</span>
           </div>
@@ -251,7 +287,7 @@
       </div>
 
       <!-- ===== RIGHT COLUMN: Player + Controls ===== -->
-      <div class="stack">
+      <div class="stack player-col">
         <section class="panel" style="padding: 0; overflow: hidden;">
           <div class="video-stage" style="border-radius: 14px 14px 0 0; border: none;">
             <video x-ref="videoPlayer" playsinline muted></video>
@@ -260,7 +296,7 @@
             <span class="video-badge right" x-show="hasPlayed" x-cloak>
               Buffer <span class="tabular" x-text="bufferLen.toFixed(1) + 's'"></span>
             </span>
-            <span class="video-badge live" x-show="isLive && hasPlayed" x-cloak
+            <span class="video-badge live" x-show="isLive && atLiveEdge && hasPlayed" x-cloak
                   style="top: auto; bottom: 12px; left: 12px;">LIVE</span>
 
             <div class="video-overlay" x-show="!hasPlayed" x-cloak>
@@ -289,7 +325,10 @@
               <span class="total tabular" x-text="'/ ' + fmtTime(duration)"></span>
             </div>
             <div class="row" style="margin-left: auto; gap: 8px;">
+              <button class="button button-sm" x-show="isLive" x-cloak @click="goLive()"
+                      :disabled="!isReady || locked || atLiveEdge">Go to live</button>
               <input type="text" x-model="gotoTime" placeholder="00:05:23" style="width: 110px;" class="mono"
+                     aria-label="Go to time (HH:MM:SS)"
                      @keydown.enter.prevent="gotoTimeNow()" :disabled="!isReady || locked">
               <button class="button button-sm" @click="gotoTimeNow()" :disabled="!isReady || locked">Go to</button>
             </div>
@@ -297,18 +336,21 @@
 
           <!-- Scrubber + bookmarks -->
           <div class="scrubber" style="margin-bottom: 12px;">
-            <div class="scrubber-bookmarks" aria-hidden="true">
+            <div class="scrubber-bookmarks">
               <template x-for="b in bookmarks" :key="b.id">
                 <button class="scrubber-bookmark" :class="b.source === 'encoder' ? 'encoder' : 'decoder'"
                         :style="`left: ${bookmarkLeft(b)};`"
                         :title="`${b.name} (${fmtTime(b.time_pos)})`"
+                        :aria-label="`Jump to bookmark ${b.name} at ${fmtTime(b.time_pos)}`"
+                        :disabled="locked"
                         @click.prevent="jumpToBookmark(b)"></button>
               </template>
             </div>
             <input type="range" min="0" :max="duration || 100" step="0.01"
                    :value="currentTime" :style="`--scrub: ${scrubFill()}`"
                    @input="onScrubInput($event)" @change="onScrubChange($event)"
-                   :disabled="!isReady || locked" aria-label="Playback position">
+                   :disabled="!isReady || locked" aria-label="Playback position"
+                   :aria-valuetext="`${fmtTime(currentTime)} of ${fmtTime(duration)}`">
           </div>
 
           <!-- Cache progress (live event being cached) -->
@@ -341,13 +383,15 @@
           <!-- Audio mute toggles -->
           <div class="row" style="gap: 12px; padding-top: 12px; border-top: 1px solid var(--line);">
             <p class="eyebrow" style="margin-right: 6px;">Audio</p>
-            <button class="button button-sm" :class="{ 'button-danger': browserMuted }" @click="toggleBrowserMute()" :disabled="locked">
+            <button class="button button-sm" :class="{ 'button-danger': browserMuted }" @click="toggleBrowserMute()" :disabled="locked"
+                    aria-label="Mute browser audio" :aria-pressed="browserMuted">
               <svg x-show="browserMuted" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M11 5L6 9H3v6h3l5 4V5zM17 9l4 4M21 9l-4 4"/></svg>
               <svg x-show="!browserMuted" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M11 5L6 9H3v6h3l5 4V5zM16 9a4 4 0 010 6"/></svg>
               <span>Browser</span>
               <span class="hint" x-text="browserMuted ? '(muted)' : '(on)'"></span>
             </button>
-            <button class="button button-sm" x-show="hardwareActive" x-cloak :class="{ 'button-danger': mpvMuted }" @click="toggleMPVMute()" :disabled="locked">
+            <button class="button button-sm" x-show="hardwareActive" x-cloak :class="{ 'button-danger': mpvMuted }" @click="toggleMPVMute()" :disabled="locked"
+                    aria-label="Mute projector audio" :aria-pressed="mpvMuted">
               <svg x-show="mpvMuted" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M11 5L6 9H3v6h3l5 4V5zM17 9l4 4M21 9l-4 4"/></svg>
               <svg x-show="!mpvMuted" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M11 5L6 9H3v6h3l5 4V5zM16 9a4 4 0 010 6"/></svg>
               <span>Projector</span>
@@ -363,7 +407,8 @@
 
           <div class="panel-sub" style="margin-top: 12px;">
             <div class="row" style="gap: 8px;">
-              <input type="text" x-model="newBookmarkName" placeholder="Optional name. Defaults to frame number." @keydown.enter.prevent="createBookmark()" :disabled="locked">
+              <input type="text" x-model="newBookmarkName" placeholder="Optional name. Defaults to frame number."
+                     aria-label="Bookmark name" @keydown.enter.prevent="createBookmark()" :disabled="locked">
               <button class="button button-primary" @click="createBookmark()" :disabled="!activeCacheEventId || locked">Mark here</button>
             </div>
           </div>
@@ -381,8 +426,8 @@
                   </div>
                 </div>
                 <div class="bookmark-actions">
-                  <button class="button button-sm" @click="jumpToBookmark(b)" :disabled="locked">Jump</button>
-                  <button class="button button-sm button-danger" x-show="b.source === 'decoder'" @click="deleteBookmark(b)" :disabled="locked">Delete</button>
+                  <button class="button button-sm" @click="jumpToBookmark(b)" :disabled="locked" :aria-label="'Jump to bookmark ' + b.name">Jump</button>
+                  <button class="button button-sm button-danger" x-show="b.source === 'decoder'" @click="deleteBookmark(b)" :disabled="locked" :aria-label="'Delete bookmark ' + b.name">Delete</button>
                 </div>
               </div>
             </template>

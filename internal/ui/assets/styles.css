@@ -24,6 +24,10 @@
   --warn:      #d29922;
   --bad:       #f85149;
   --live-red:  #ff1a1a;
+  /* Darker members of the same red family for surfaces that carry
+     small white text (banner, LIVE badge, error toast): >= 4.5:1. */
+  --live-red-strong: #c41010;
+  --bad-strong:      #b42318;
 
   /* Encoder/decoder share these. The "info" blue is reserved for purely
      informational accents (cache, bookmarks-from-encoder, etc.) so amber
@@ -84,11 +88,22 @@ body {
   *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
 }
 
-/* Live/locked framing on the encoder; "PROJECTOR ACTIVE" framing on the
-   decoder. Both push the page down to make room for the sticky banner. */
-body.is-live   { padding-top: 64px; box-shadow: inset 0 0 0 4px var(--live-red); }
-body.is-locked { padding-top: 64px; box-shadow: inset 0 0 0 4px var(--accent); }
-body.is-live.is-locked { box-shadow: inset 0 0 0 4px var(--live-red); }
+/* Live framing on the encoder; "CONTROLS LOCKED" framing on the decoder.
+   Both push the page down to make room for the fixed banner. The frame
+   is a fixed overlay so it stays on screen while the page scrolls (an
+   inset box-shadow on <body> scrolled away with the content). */
+body.is-live,
+body.is-locked { padding-top: 64px; }
+body.is-live::after,
+body.is-locked::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 99;            /* above content, below the banner (100) */
+  pointer-events: none;
+  border: 4px solid var(--accent);
+}
+body.is-live::after { border-color: var(--live-red); }
 
 .shell {
   width: min(1280px, calc(100% - 32px));
@@ -137,7 +152,7 @@ code, .mono {
 .banner-right  { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
 
 .banner.live {
-  background: linear-gradient(180deg, var(--live-red) 0%, color-mix(in srgb, var(--live-red) 90%, black) 100%);
+  background: linear-gradient(180deg, var(--live-red-strong) 0%, color-mix(in srgb, var(--live-red-strong) 88%, black) 100%);
   box-shadow: 0 4px 24px rgba(255, 26, 26, 0.35);
 }
 .banner.locked {
@@ -181,7 +196,7 @@ code, .mono {
 .banner-btn:hover            { background: rgba(255,255,255,0.2); border-color: rgba(255,255,255,0.6); }
 .banner-stop                 { background: rgba(0,0,0,0.25); border-color: rgba(255,255,255,0.7); }
 .banner-stop:hover           { background: rgba(0,0,0,0.4); }
-.banner-confirm              { background: #fff; color: var(--live-red); border-color: #fff; }
+.banner-confirm              { background: #fff; color: var(--live-red-strong); border-color: #fff; }
 .banner-confirm:hover        { background: rgba(255,255,255,0.9); }
 .banner.locked .banner-confirm { color: var(--accent-on); }
 
@@ -202,7 +217,6 @@ code, .mono {
 .brand-mark { width: 26px; height: 26px; color: var(--accent); }
 .brand-sub { color: var(--muted); font-weight: 500; }
 .topbar-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-.app-version { color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: 0.04em; }
 
 .icon-btn {
   width: 38px; height: 38px;
@@ -236,8 +250,6 @@ code, .mono {
 .conn-pill.ok::before    { background: var(--good); }
 .conn-pill.warn  { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
 .conn-pill.warn::before  { background: var(--warn); animation: live-pulse 1.4s ease-in-out infinite; }
-.conn-pill.lost  { background: color-mix(in srgb, var(--bad)  18%, transparent); color: var(--bad);  }
-.conn-pill.lost::before  { background: var(--bad); }
 .conn-pill.idle  { background: var(--panel-2); color: var(--muted); border: 1px solid var(--line); }
 .conn-pill.idle::before  { background: var(--muted-2); }
 
@@ -256,6 +268,8 @@ code, .mono {
 }
 @media (max-width: 960px) {
   .grid-2, .grid-3-2 { grid-template-columns: 1fr; }
+  /* Decoder: on a single column the player comes first, controls after. */
+  .grid-3-2 > .player-col { order: -1; }
 }
 
 .stack       { display: flex; flex-direction: column; gap: 18px; }
@@ -323,20 +337,6 @@ code, .mono {
 .button-primary:hover:not(:disabled) { filter: brightness(1.05); box-shadow: 0 8px 26px rgba(245, 158, 11, 0.32); }
 .button-primary:disabled { background: var(--panel-2); color: var(--muted); box-shadow: none; border: 1px dashed var(--line); }
 
-.button-go {
-  background: var(--good);
-  border-color: var(--good);
-  color: #07120a;
-}
-.button-go:hover:not(:disabled) { filter: brightness(1.08); }
-
-.button-stop {
-  background: var(--bad);
-  border-color: var(--bad);
-  color: #1a0707;
-}
-.button-stop:hover:not(:disabled) { filter: brightness(1.05); }
-
 .button-danger {
   border-color: color-mix(in srgb, var(--bad) 70%, var(--line));
   color: var(--bad);
@@ -349,7 +349,7 @@ code, .mono {
 
 .button-full { width: 100%; }
 
-/* Big "Start streaming" / "Connect" call-to-action used in hero cards. */
+/* Big "Start streaming" call-to-action used in the encoder hero card. */
 .primary-action {
   width: 100%;
   min-height: 56px;
@@ -374,14 +374,9 @@ code, .mono {
   cursor: not-allowed;
   border: 1px dashed var(--line);
 }
-.primary-action.danger {
-  background: linear-gradient(180deg, var(--bad) 0%, color-mix(in srgb, var(--bad) 80%, black) 100%);
-  color: #fff;
-  box-shadow: 0 6px 20px rgba(248, 81, 73, 0.28);
-}
 
 /* =========== FORMS =========== */
-label:where(:not(.checkbox-row):not(.adaptive-toggle)) {
+label:where(:not(.checkbox-row)) {
   display: block;
   margin-top: 14px;
   color: var(--muted);
@@ -426,21 +421,11 @@ select option {
 }
 
 .form-row     { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.form-row-3   { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .form-actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
 @media (max-width: 720px) {
-  .form-row, .form-row-3 { grid-template-columns: 1fr; }
+  .form-row { grid-template-columns: 1fr; }
 }
 
-.field-label {
-  display: block;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  margin: 14px 0 6px;
-}
 .field-help {
   display: block;
   color: var(--muted);
@@ -449,6 +434,32 @@ select option {
   line-height: 1.4;
 }
 .field-help.warn { color: var(--warn); }
+
+/* Neutral progress line ("Starting local cache…", "Waiting for stream…").
+   Deliberately not styled like the error banner. */
+.status-line {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 8px;
+}
+.status-line::before {
+  content: "";
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--info);
+  animation: live-pulse 1.4s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.stale-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  max-height: 120px;
+  overflow-y: auto;
+}
 
 .checkbox-row {
   display: flex;
@@ -496,7 +507,6 @@ select option {
 .pill.warn { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--line)); }
 .pill.bad  { background: color-mix(in srgb, var(--bad)  16%, transparent); color: var(--bad);  border-color: color-mix(in srgb, var(--bad)  40%, var(--line)); }
 .pill.info { background: color-mix(in srgb, var(--info) 16%, transparent); color: var(--info); border-color: color-mix(in srgb, var(--info) 40%, var(--line)); }
-.pill.accent { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent-2); border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
 .pill.live { background: color-mix(in srgb, var(--bad) 18%, transparent); color: #ffb4b1; border-color: var(--bad); }
 .pill.live::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--bad); animation: live-pulse 1.4s ease-in-out infinite; }
 
@@ -510,9 +520,8 @@ select option {
 .pill-dot.good { background: var(--good);  box-shadow: 0 0 8px color-mix(in srgb, var(--good) 60%, transparent); }
 .pill-dot.warn { background: var(--warn);  box-shadow: 0 0 8px color-mix(in srgb, var(--warn) 60%, transparent); }
 .pill-dot.bad  { background: var(--bad);   box-shadow: 0 0 8px color-mix(in srgb, var(--bad)  60%, transparent); }
-.pill-dot.info { background: var(--info);  box-shadow: 0 0 8px color-mix(in srgb, var(--info) 60%, transparent); }
 
-/* =========== METRICS / KV =========== */
+/* =========== METRICS =========== */
 .metrics {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
@@ -526,18 +535,6 @@ select option {
 }
 .metrics dt { color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
 .metrics dd { margin: 4px 0 0; font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
-
-.kv {
-  display: flex; flex-direction: column;
-  gap: 8px;
-  font-size: 13px;
-}
-.kv-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.kv-row dt { color: var(--muted); font-weight: 500; }
-.kv-row dd { margin: 0; color: var(--text); font-variant-numeric: tabular-nums; }
-.kv-row dd.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
-.kv-row.bad dd  { color: var(--bad); }
-.kv-row.good dd { color: var(--good); }
 
 /* =========== VIDEO STAGE =========== */
 .video-stage {
@@ -579,7 +576,7 @@ select option {
 }
 .video-badge.left  { left: 12px; }
 .video-badge.right { right: 12px; }
-.video-badge.live  { background: rgba(248,81,73,0.85); color: #fff; }
+.video-badge.live  { background: var(--live-red-strong); color: #fff; }
 .video-badge.live::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #fff; animation: live-pulse 1.4s ease-in-out infinite; }
 
 /* =========== PLAYER CONTROLS =========== */
@@ -670,20 +667,34 @@ select option {
   height: 8px;
   pointer-events: none;
 }
+/* 16px transparent hit area; the visible 8px dot is drawn by ::before. */
 .scrubber-bookmark {
   position: absolute;
   top: 50%;
-  width: 8px; height: 8px;
-  margin-left: -4px;
+  width: 16px; height: 16px;
+  margin: 0 0 0 -8px;
+  padding: 0;
+  border: none;
   border-radius: 50%;
   transform: translateY(-50%);
-  background: var(--info);
-  box-shadow: 0 0 6px currentColor;
+  background: transparent;
+  color: var(--info);
   pointer-events: auto;
   cursor: pointer;
 }
-.scrubber-bookmark.encoder { background: var(--info); }
-.scrubber-bookmark.decoder { background: var(--accent-2); }
+.scrubber-bookmark::before {
+  content: "";
+  position: absolute;
+  top: 50%; left: 50%;
+  width: 8px; height: 8px;
+  margin: -4px 0 0 -4px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+}
+.scrubber-bookmark.encoder { color: var(--info); }
+.scrubber-bookmark.decoder { color: var(--accent-2); }
+.scrubber-bookmark:disabled { cursor: not-allowed; opacity: 0.5; }
 
 .jog-row {
   display: flex; flex-wrap: wrap; gap: 6px;
@@ -851,7 +862,7 @@ select option {
   box-shadow: 0 12px 32px rgba(0,0,0,0.5);
 }
 .toast.visible { opacity: 1; transform: translateY(0); }
-.toast.bad  { background: var(--bad); color: #fff; }
+.toast.bad  { background: var(--bad-strong); color: #fff; }
 .toast.good { background: var(--good); color: #07120a; }
 
 /* =========== MISC =========== */
@@ -860,21 +871,6 @@ select option {
   background: var(--line);
   margin: 14px 0;
   border: none;
-}
-
-.copy-row {
-  display: flex; align-items: center; gap: 8px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--bg);
-  margin-top: 8px;
-}
-.copy-row code {
-  flex: 1;
-  color: var(--accent-2);
-  word-break: break-all;
-  user-select: all;
 }
 
 @media (max-width: 720px) {

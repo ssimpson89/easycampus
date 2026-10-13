@@ -28,11 +28,16 @@ const FALLBACK_PRESETS = [
 ];
 const DEFAULT_PRESET_ID = "consumer-1080p30";
 
+// HLS preview retry policy: exponential backoff, then give up.
+const PREVIEW_MAX_RETRIES = 6;
+// Upload status polls stop after this many consecutive 404s.
+const UPLOAD_404_LIMIT = 5;
+
 document.addEventListener("alpine:init", () => {
   Alpine.data("encoder", () => ({
 
     // -------- Server-sourced --------
-    stream:   { is_running: false, event_id: null, uptime_seconds: 0, last_error: null, pid: null },
+    stream:   { is_running: false, event_id: null, uptime_seconds: 0, last_error: null, ffmpeg_pid: null, quality_preset: "" },
     inputs:   [],
     events:   [],
     health:   null,
@@ -48,14 +53,21 @@ document.addEventListener("alpine:init", () => {
 
     // -------- UI state --------
     connectionOK:  true,
-    nowTick:       Date.now(),
+    nodeType:      "",      // NODE_TYPE from /api/config, shown in the topbar
     isStarting:    false,
     isStopping:    false,
     stopConfirm:   false,
     error:         "",
     toast:         "",
+    // Screen-reader announcement. Changes only on start/stop so the
+    // ticking uptime in the banner isn't read out every 2 s.
+    liveAnnouncement: "",
 
     // -------- Local camera preview --------
+    // getUserMedia only exists in secure contexts (HTTPS / localhost).
+    // Over plain http from another machine the preview can't work, so
+    // the panel is hidden rather than offering a button that fails.
+    secureContext:  !!window.isSecureContext && !!navigator.mediaDevices,
     cameraReady:    false,
     cameraLoading:  false,
     cameraError:    "",
@@ -66,7 +78,6 @@ document.addEventListener("alpine:init", () => {
     uploadStatus:  "",
     uploadProgress:0,
     uploadEventId: "",
-    uploadKind:    "",  // "encoder" (HLS-only upload) or "external" (URL-fetched)
 
     // -------- External source form --------
     extName:    "",
@@ -80,6 +91,8 @@ document.addEventListener("alpine:init", () => {
     previewReady:     false,
     previewPlaying:   false,
     previewLive:      false,
+    previewAtEdge:    false,   // playhead within ~2 segments of the live edge
+    previewStatus:    "",      // neutral status line ("Waiting for stream…")
     previewTime:      0,
     previewDuration:  0,
     previewSeek:      "",
@@ -88,8 +101,11 @@ document.addEventListener("alpine:init", () => {
 
     _statusTimer:  null,
     _eventsTimer:  null,
-    _nowTimer:     null,
     _toastTimer:   null,
+    _stopConfirmTimer: null,
+    _userStopRequested: false,   // distinguishes operator stop from a crash
+    _previewRetries: 0,
+    _previewRetryTimer: null,
 
     // qualityTiers is the tier-grouped catalog fetched from /api/quality
     // at init. Each tier carries a label and a list of preset summaries.
@@ -112,6 +128,7 @@ document.addEventListener("alpine:init", () => {
         this.refreshStatus(),
         this.loadEvents(),
         this.fetchQualityCatalog(),
+        this.loadConfig(),
       ]);
 
       // Persist form state on change.
@@ -126,7 +143,6 @@ document.addEventListener("alpine:init", () => {
       // event list is cold (30 s) since it only changes on user action.
       this._statusTimer = setInterval(() => this.refreshStatus(), 2000);
       this._eventsTimer = setInterval(() => this.loadEvents(), 30000);
-      this._nowTimer    = setInterval(() => { this.nowTick = Date.now(); }, 1000);
 
       // Warn the operator if they try to navigate away mid-stream.
       window.addEventListener("beforeunload", (e) => {
@@ -140,6 +156,7 @@ document.addEventListener("alpine:init", () => {
       // browser has already granted permission. We use enumerateDevices()
       // as a feature probe — if labels come back populated, permission
       // has been granted previously and getUserMedia won't prompt.
+      if (!this.secureContext) return;
       try {
         const devs = await navigator.mediaDevices.enumerateDevices();
         const vid = devs.filter(d => d.kind === "videoinput");
@@ -156,6 +173,28 @@ document.addEventListener("alpine:init", () => {
     // STATE
     // ============================================================
     get isLive() { return !!this.stream?.is_running; },
+
+    // isLiveEvent: an event is live only when it is the event the
+    // running stream is writing to. ev.status alone can be stale (a
+    // crashed ffmpeg used to leave "running" behind).
+    isLiveEvent(ev) {
+      return !!ev && this.isLive && ev.id === this.stream?.event_id;
+    },
+
+    // livePreset resolves the preset the *server* is encoding with
+    // (StreamStatus.quality_preset), not whatever this browser has
+    // selected in the idle form. Unknown IDs still show their raw ID.
+    get livePreset() {
+      const id = this.stream?.quality_preset;
+      if (!id) return null;
+      return this.allPresets.find(p => p.id === id) || { id, label: id };
+    },
+
+    liveBitrateLabel() {
+      const p = this.livePreset;
+      if (!p || !p.video_bitrate_kbps) return "—";
+      return F.formatBitrate(p.video_bitrate_kbps * 1000);
+    },
 
     get liveUptime() {
       if (!this.stream?.uptime_seconds) return "0:00:00";
@@ -249,15 +288,24 @@ document.addEventListener("alpine:init", () => {
           : "Events directory is not writable.",
       });
 
-      rows.push({
-        label: "Camera preview",
-        status: this.cameraReady ? "good" : this.cameraError ? "warn" : "idle",
-        detail: this.cameraReady
-          ? "Local preview running"
-          : this.cameraError || "Click Start camera preview to enable.",
-      });
+      if (this.secureContext) {
+        rows.push({
+          label: "Camera preview",
+          status: this.cameraReady ? "good" : this.cameraError ? "warn" : "idle",
+          detail: this.cameraReady
+            ? "Preview of this browser's camera is running"
+            : this.cameraError || "Optional. Click Start camera preview to check this browser's camera.",
+        });
+      }
 
       return rows;
+    },
+
+    preflightStatusText(status) {
+      if (status === "good") return "OK:";
+      if (status === "warn") return "Warning:";
+      if (status === "bad")  return "Problem:";
+      return "Not checked:";
     },
 
     // ============================================================
@@ -322,15 +370,40 @@ document.addEventListener("alpine:init", () => {
       }
       if (!r.ok) {
         const msg = (data && (data.detail || data.error)) || `HTTP ${r.status}`;
-        throw new Error(msg);
+        const err = new Error(msg);
+        err.status = r.status;
+        throw err;
       }
       return data;
+    },
+
+    async loadConfig() {
+      try {
+        const cfg = await this.api("/api/config");
+        this.nodeType = cfg?.NODE_TYPE || "";
+      } catch (_) {}
     },
 
     async refreshStatus() {
       try {
         const s = await this.api("/api/status");
+        const wasRunning = !!this.stream?.is_running;
         this.stream = s || this.stream;
+        const nowRunning = !!this.stream?.is_running;
+        if (wasRunning && !nowRunning) {
+          // running -> stopped. If the operator didn't ask for it, the
+          // encoder crashed or ffmpeg exited; say so loudly.
+          if (!this._userStopRequested) {
+            this.error = this.stream.last_error || "Stream stopped unexpectedly";
+            this.liveAnnouncement = "Stream stopped unexpectedly";
+          } else {
+            this.liveAnnouncement = "Stream stopped";
+          }
+          this._userStopRequested = false;
+          this.loadEvents();
+        } else if (!wasRunning && nowRunning) {
+          this.liveAnnouncement = "Stream is live";
+        }
         // Health gets a second probe occasionally; cheap enough to bundle.
         const h = await this.api("/api/health").catch(() => null);
         if (h) this.health = h;
@@ -348,6 +421,7 @@ document.addEventListener("alpine:init", () => {
         if (this.inputs.length > 0 && !this.inputs.some(i => i.id === this.selectedInput)) {
           this.selectedInput = this.inputs[0].id;
         }
+        this.resyncSelect("inputSelect", this.selectedInput);
       } catch (e) {
         console.error("Failed to fetch inputs:", e);
       }
@@ -377,6 +451,7 @@ document.addEventListener("alpine:init", () => {
             this.selectedPreset = (this.allPresets.find(p => p.id === DEFAULT_PRESET_ID)
               || this.allPresets[0] || {}).id || DEFAULT_PRESET_ID;
           }
+          this.resyncSelect("presetSelect", this.selectedPreset);
         }
       } catch (e) {
         console.warn("Failed to fetch quality catalog, using fallback:", e);
@@ -425,21 +500,40 @@ document.addEventListener("alpine:init", () => {
       }
     },
 
+    // resyncSelect re-applies a model value to a <select> after its
+    // <option>s arrive asynchronously (x-for renders after x-model ran,
+    // so the browser would otherwise show the first option).
+    resyncSelect(ref, value) {
+      this.$nextTick(() => {
+        const el = this.$refs[ref];
+        if (el && value != null) el.value = String(value);
+      });
+    },
+
     showStopConfirm() {
       this.stopConfirm = true;
       this.$nextTick(() => this.$refs.confirmStop?.focus?.());
-      setTimeout(() => { this.stopConfirm = false; }, 6000);
+      clearTimeout(this._stopConfirmTimer);
+      this._stopConfirmTimer = setTimeout(() => { this.stopConfirm = false; }, 6000);
+    },
+
+    cancelStop() {
+      clearTimeout(this._stopConfirmTimer);
+      this._stopConfirmTimer = null;
+      this.stopConfirm = false;
     },
 
     async confirmStop() {
-      this.stopConfirm = false;
+      this.cancelStop();
       this.isStopping = true;
+      this._userStopRequested = true;
       try {
         await this.api("/api/stream/stop", { method: "POST" });
         this.showToast("Stream stopped", "good");
         await this.refreshStatus();
         await this.loadEvents();
       } catch (e) {
+        this._userStopRequested = false;
         this.error = e.message;
         this.showToast(e.message, "bad");
       } finally {
@@ -451,6 +545,7 @@ document.addEventListener("alpine:init", () => {
     // CAMERA PREVIEW (in-browser)
     // ============================================================
     async initCamera(deviceId = null) {
+      if (!this.secureContext) return;
       this.cameraLoading = true;
       this.cameraError = "";
       try {
@@ -487,7 +582,7 @@ document.addEventListener("alpine:init", () => {
     // capitalization and (Built-in) suffixes.
     async syncPreviewToInput(backendId) {
       const backendDevice = this.inputs.find(i => i.id === backendId);
-      if (!backendDevice || this.browserDevices.length === 0) return;
+      if (!this.secureContext || !backendDevice || this.browserDevices.length === 0) return;
       const target = backendDevice.name.toLowerCase();
       const match = this.browserDevices.find(d => {
         const lbl = (d.label || "").toLowerCase();
@@ -517,6 +612,9 @@ document.addEventListener("alpine:init", () => {
       this.previewTime = 0;
       this.previewDuration = 0;
       this.previewLive = false;
+      this.previewAtEdge = false;
+      this.previewStatus = "";
+      this._previewRetries = 0;
       this.bookmarks = [];
       this.newBookmarkName = "";
 
@@ -525,10 +623,16 @@ document.addEventListener("alpine:init", () => {
       this.loadEventBookmarks();
     },
 
-    attachPreview() {
+    attachPreview({ retry = false } = {}) {
       const video = this.$refs.previewVideo;
       if (!video || !this.selectedEvent) return;
 
+      clearTimeout(this._previewRetryTimer);
+      this._previewRetryTimer = null;
+      if (!retry) {
+        this._previewRetries = 0;
+        this.previewStatus = "";
+      }
       if (this.previewHls) {
         try { this.previewHls.destroy(); } catch (_) {}
         this.previewHls = null;
@@ -536,7 +640,7 @@ document.addEventListener("alpine:init", () => {
 
       const eventId  = this.selectedEvent.id;
       const masterUrl = `/events/${eventId}/master.m3u8`;
-      const isLiveEvent = this.selectedEvent.status === "running";
+      const isLiveEvent = this.isLiveEvent(this.selectedEvent);
 
       if (window.Hls && Hls.isSupported()) {
         const hls = new Hls({
@@ -549,7 +653,6 @@ document.addEventListener("alpine:init", () => {
           liveMaxLatencyDurationCount: 5,
           backBufferLength: 30,
           autoStartLoad: true,
-          abrEnabled: false,
           startLevel: 0,
           testBandwidth: false,
           progressive: true,
@@ -557,22 +660,37 @@ document.addEventListener("alpine:init", () => {
         hls.loadSource(masterUrl);
         hls.attachMedia(video);
         hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
+          this._previewRetries = 0;
+          this.previewStatus = "";
           this.previewReady = true;
           this.previewDuration = video.duration || 0;
           this.previewTime = video.currentTime || 0;
           const lvl = data.levels?.[0]?.details;
           this.previewLive = lvl ? !!lvl.live : isLiveEvent;
           if (this.previewLive && video.seekable.length > 0) {
-            const live = video.seekable.end(0);
+            const live = video.seekable.end(video.seekable.length - 1);
             video.currentTime = Math.max(0, live - 5);
             this.previewTime = video.currentTime;
           }
         });
+        hls.on(Hls.Events.LEVEL_LOADED, (_e, data) => {
+          if (data?.details) this.previewLive = !!data.details.live;
+        });
+        hls.on(Hls.Events.FRAG_LOADED, () => {
+          if (this._previewRetries) { this._previewRetries = 0; this.previewStatus = ""; }
+        });
         hls.on(Hls.Events.ERROR, (_e, data) => {
           if (!data.fatal) return;
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR)        hls.startLoad();
-          else if (data.type === Hls.ErrorTypes.MEDIA_ERROR)     hls.recoverMediaError();
-          else { try { hls.destroy(); } catch (_) {} this.previewHls = null; }
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            this.schedulePreviewRetry(hls, data);
+          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            hls.recoverMediaError();
+          } else {
+            try { hls.destroy(); } catch (_) {}
+            if (this.previewHls === hls) this.previewHls = null;
+            this.previewStatus = "";
+            this.error = `Preview error: ${data.details || data.type}`;
+          }
         });
         this.previewHls = hls;
       } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
@@ -585,8 +703,61 @@ document.addEventListener("alpine:init", () => {
       }
     },
 
+    // schedulePreviewRetry: exponential backoff (1 s, 2 s, 4 s … capped
+    // at 15 s) for fatal network errors, giving up after
+    // PREVIEW_MAX_RETRIES. A manifest that failed to load is torn down
+    // and re-attached; anything else just restarts loading.
+    schedulePreviewRetry(hls, data) {
+      if (this.previewHls !== hls) return;
+      if (this._previewRetries >= PREVIEW_MAX_RETRIES) {
+        try { hls.destroy(); } catch (_) {}
+        this.previewHls = null;
+        this.previewStatus = "";
+        this.error = "Preview stream unavailable. Check that the event still has segments, then select it again.";
+        return;
+      }
+      const delay = Math.min(1000 * 2 ** this._previewRetries, 15000);
+      this._previewRetries++;
+      this.previewStatus = "Waiting for stream…";
+      const manifestFailed = [
+        Hls.ErrorDetails.MANIFEST_LOAD_ERROR,
+        Hls.ErrorDetails.MANIFEST_LOAD_TIMEOUT,
+      ].includes(data.details);
+      clearTimeout(this._previewRetryTimer);
+      this._previewRetryTimer = setTimeout(() => {
+        if (this.previewHls !== hls) return;
+        if (manifestFailed) this.attachPreview({ retry: true });
+        else hls.startLoad();
+      }, delay);
+    },
+
+    // updatePreviewEdge flags whether the playhead is within ~2 target
+    // durations of the live edge; the "Live edge" badge only shows then.
+    updatePreviewEdge(video) {
+      if (!this.previewLive || !video || video.seekable.length === 0) {
+        this.previewAtEdge = false;
+        return;
+      }
+      const hls = this.previewHls;
+      const lvl = hls?.levels?.[Math.max(0, hls.currentLevel)]?.details;
+      const target = lvl?.targetduration || 6;
+      const edge = video.seekable.end(video.seekable.length - 1);
+      this.previewAtEdge = (edge - video.currentTime) <= target * 2;
+    },
+
+    previewGoLive() {
+      const v = this.$refs.previewVideo;
+      if (!v) return;
+      let t = this.previewHls?.liveSyncPosition;
+      if (!Number.isFinite(t) && v.seekable.length > 0) t = v.seekable.end(v.seekable.length - 1) - 3;
+      if (!Number.isFinite(t)) return;
+      v.currentTime = Math.max(0, t);
+      this.previewTime = v.currentTime;
+      v.play().catch(() => {});
+    },
+
     // <video> event handlers (wired via x-on:* on the element)
-    onPreviewTimeUpdate(e)  { if (!this._scrubbing) this.previewTime = e.target.currentTime; },
+    onPreviewTimeUpdate(e)  { this.previewTime = e.target.currentTime; this.updatePreviewEdge(e.target); },
     onPreviewLoadedMeta(e)  { this.previewDuration = e.target.duration || 0; this.previewReady = true; },
     onPreviewDurationChange(e) {
       const d = e.target.duration;
@@ -605,8 +776,7 @@ document.addEventListener("alpine:init", () => {
     previewFrameStep(dir) {
       const v = this.$refs.previewVideo;
       if (!v) return;
-      const fps = this.selectedEvent?.fps || 30;
-      v.currentTime += dir / fps;
+      v.currentTime += dir / F.eventFps(this.selectedEvent);
     },
 
     previewJump(seconds) {
@@ -664,7 +834,7 @@ document.addEventListener("alpine:init", () => {
       if (!this.selectedEvent) return;
       const v = this.$refs.previewVideo;
       const timePos = v?.currentTime || 0;
-      const fps = this.selectedEvent.fps || 30;
+      const fps = F.eventFps(this.selectedEvent);
       const frame = Math.round(timePos * fps);
       const name = this.newBookmarkName.trim() || `Frame ${frame}`;
       const bookmark = {
@@ -726,7 +896,11 @@ document.addEventListener("alpine:init", () => {
       if (!confirm(`Delete event "${ev.name}"? This cannot be undone.`)) return;
       try {
         await this.api(`/api/events/${ev.id}`, { method: "DELETE" });
-        if (this.selectedEvent?.id === ev.id) this.selectedEvent = null;
+        if (this.selectedEvent?.id === ev.id) {
+          clearTimeout(this._previewRetryTimer);
+          if (this.previewHls) { try { this.previewHls.destroy(); } catch (_) {} this.previewHls = null; }
+          this.selectedEvent = null;
+        }
         await this.loadEvents();
         this.showToast("Event deleted", "good");
       } catch (e) {
@@ -748,7 +922,6 @@ document.addEventListener("alpine:init", () => {
       this.uploadStatus = "Uploading…";
       this.uploadProgress = 0;
       this.uploadEventId = "";
-      this.uploadKind = "encoder";
 
       const fd = new FormData();
       fd.append("file", file);
@@ -760,7 +933,7 @@ document.addEventListener("alpine:init", () => {
 
       try {
         const r = await fetch("/api/events/upload", { method: "POST", body: fd });
-        if (!r.ok) throw new Error(await r.text() || `HTTP ${r.status}`);
+        if (!r.ok) throw new Error(F.errorDetail(await r.text(), r.status));
         const data = await r.json();
         this.uploadEventId = data.event_id;
         this.uploadStatus = "Processing…";
@@ -775,28 +948,38 @@ document.addEventListener("alpine:init", () => {
     },
 
     async pollUploadStatus(eventId) {
+      // A 404 right after upload can be a race with the status file
+      // being written, so tolerate a few before giving up.
+      let notFound = 0;
       const tick = async () => {
+        let data;
         try {
-          const data = await this.api(`/api/events/upload/${eventId}/status`).catch(() => null);
-          if (!data) { setTimeout(tick, 2000); return; }
-          if (data.status === "completed") {
-            this.uploadStatus = "Ready";
-            this.uploadProgress = 100;
-            await this.loadEvents();
-            setTimeout(() => { this.uploadStatus = ""; this.uploadProgress = 0; }, 3000);
+          data = await this.api(`/api/events/upload/${eventId}/status`);
+        } catch (e) {
+          if (e.status === 404 && ++notFound >= UPLOAD_404_LIMIT) {
+            this.uploadStatus = "Failed";
+            this.showToast("Upload status not found. The upload may have been removed.", "bad");
             return;
           }
-          if (data.status === "failed") {
-            this.uploadStatus = "Processing failed";
-            this.showToast("Video processing failed", "bad");
-            return;
-          }
-          this.uploadStatus = "Processing video…";
-          this.uploadProgress = Math.min(data.progress || 0, 95);
           setTimeout(tick, 2000);
-        } catch (_) {
-          setTimeout(tick, 2000);
+          return;
         }
+        notFound = 0;
+        if (data?.status === "completed") {
+          this.uploadStatus = "Ready";
+          this.uploadProgress = 100;
+          await this.loadEvents();
+          setTimeout(() => { this.uploadStatus = ""; this.uploadProgress = 0; }, 3000);
+          return;
+        }
+        if (data?.status === "failed") {
+          this.uploadStatus = "Failed";
+          this.showToast("Video processing failed", "bad");
+          return;
+        }
+        this.uploadStatus = "Processing video…";
+        this.uploadProgress = Math.min(data?.progress || 0, 95);
+        setTimeout(tick, 2000);
       };
       tick();
     },
@@ -846,7 +1029,7 @@ document.addEventListener("alpine:init", () => {
     get toastKind() { return this._lastToastKind || ""; },
 
     eventIcon(ev) {
-      if (ev.status === "running")    return "recording";
+      if (this.isLiveEvent(ev))       return "recording";
       if (ev.type === "upload")       return "upload";
       if (ev.type === "local_upload") return "local";
       return "standard";

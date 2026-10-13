@@ -16,15 +16,37 @@
 
 const F = window.OCFormat;
 
-// Mirror of the encoder quality presets so the upload form lets the
-// operator pick a target before uploading. /api/cache/upload accepts the
-// same "low/standard/high/ultra" strings.
-const UPLOAD_PRESETS = [
-  { id: "low",      label: "Low (720p · 2 Mbps)" },
-  { id: "standard", label: "Standard (1080p · 4 Mbps)" },
-  { id: "high",     label: "High (1080p · 6 Mbps)" },
-  { id: "ultra",    label: "Ultra (1080p · 8 Mbps)" },
+// Upload presets use the same internal/quality tier IDs as the encoder
+// (/api/cache/upload resolves them through the same catalog). The list
+// is replaced by /api/quality at init; this fallback keeps the picker
+// usable if that fetch fails.
+const UPLOAD_FALLBACK_PRESETS = [
+  { id: "consumer-720p30",  label: "Consumer 720p30 · 1280x720 · 3.5 Mbps · 30 fps" },
+  { id: "consumer-1080p30", label: "Consumer 1080p30 · 1920x1080 · 6 Mbps · 30 fps" },
 ];
+const DEFAULT_UPLOAD_PRESET = "consumer-1080p30";
+// Legacy low/standard/high/ultra values from older releases, migrated
+// on restore the same way the encoder migrates its form state.
+const LEGACY_UPLOAD_PRESETS = {
+  low:      "consumer-720p30",
+  standard: "consumer-1080p30",
+  medium:   "consumer-1080p30",
+  high:     "consumer-1080p30",
+  ultra:    "prosumer-1080p60",
+};
+
+// HLS retry policy: exponential backoff, then give up with an error.
+const HLS_MAX_RETRIES = 6;
+// Upload status polls stop after this many consecutive 404s.
+const UPLOAD_404_LIMIT = 5;
+// How long selectEvent waits for the first cached segment.
+const CACHE_READY_TIMEOUT_MS = 30000;
+// Remote event list refresh cadence while connected.
+const EVENTS_REFRESH_MS = 12000;
+// Projector status poll cadence.
+const OUTPUT_STATUS_MS = 5000;
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 document.addEventListener("alpine:init", () => {
   Alpine.data("decoder", () => ({
@@ -35,6 +57,14 @@ document.addEventListener("alpine:init", () => {
     savedStreamUrl:"",
     isConnected:   false,   // connected to a remote encoder
     isDiscovering: false,
+    nodeType:      "",      // this server's NODE_TYPE (topbar)
+    remoteIsDecoder: false, // encoder address actually points at a decoder
+    connectHint:   "",      // actionable hint after a failed connect
+    staleCaches:   [],      // cached event IDs the encoder no longer lists
+    isClearingStale: false,
+    statusLine:    "",      // neutral progress text (not an error)
+    selectingEventId: null, // event selection in flight
+    isTogglingHardware: false,
     hasPlayed:     false,   // we've attached the HLS player at least once
     events:        [],      // events fetched from the remote encoder
     allEvents:     [],      // events + local uploads, deduplicated
@@ -71,6 +101,7 @@ document.addEventListener("alpine:init", () => {
     isPlaying:    false,
     isReady:      false,
     isLive:       false,
+    atLiveEdge:   false,    // within ~2 segment durations of the live edge
     currentTime:  0,
     duration:     0,
     bufferLen:    0,
@@ -81,8 +112,8 @@ document.addEventListener("alpine:init", () => {
     mpvMuted:     true,
 
     // -------- Local uploads --------
-    uploadPresets: UPLOAD_PRESETS,
-    uploadQuality: "standard",
+    uploadPresets: UPLOAD_FALLBACK_PRESETS,
+    uploadQuality: DEFAULT_UPLOAD_PRESET,
     uploadStatus:  "",
     uploadProgress:0,
     uploadEventId: "",
@@ -108,6 +139,14 @@ document.addEventListener("alpine:init", () => {
     _lastSeekTime:  0,
     _seekTimeout:   null,
     _lastBookmarkPoll: 0,
+    _eventsPoll:    null,
+    _outputStatusPoll: null,
+    _netRetries:    0,
+    _netRetryTimer: null,
+    _selectToken:   0,
+    // play/pause events fired while we adopt mpv's state on load must
+    // not be echoed back to mpv.
+    _suppressHwUntil: 0,
 
     // ============================================================
     // INIT
@@ -135,7 +174,7 @@ document.addEventListener("alpine:init", () => {
       this.$watch("browserMuted",   (v) => localStorage.setItem("oc_dec_browser_muted", v ? "1" : "0"));
       this.$watch("mpvMuted",       (v) => localStorage.setItem("oc_dec_mpv_muted",     v ? "1" : "0"));
       this.$watch("locked",         (v) => localStorage.setItem("oc_dec_locked",        v ? "1" : "0"));
-      this.$watch("uploadQuality",  (v) => localStorage.setItem("oc_dec_upload_quality", v || "standard"));
+      this.$watch("uploadQuality",  (v) => localStorage.setItem("oc_dec_upload_quality", v || DEFAULT_UPLOAD_PRESET));
       this.$watch("playbackProfile",(v) => localStorage.setItem("oc_dec_playback_profile", v || "auto"));
 
       // Reflect lock state on <body> so the framing CSS knows.
@@ -145,6 +184,7 @@ document.addEventListener("alpine:init", () => {
       // Pre-fill encoder URL from server config if we don't have a local one.
       try {
         const cfg = await fetch("/api/config").then(r => r.ok ? r.json() : null);
+        this.nodeType = cfg?.NODE_TYPE || "";
         if (cfg?.DEFAULT_ENCODER_URL && !this.encoderUrl) {
           this.encoderUrl = cfg.DEFAULT_ENCODER_URL;
         }
@@ -155,7 +195,18 @@ document.addEventListener("alpine:init", () => {
         this.refreshOutputCapabilities(),
         this.loadCachedEventList(),
         this.loadPlaybackProfiles(),
+        this.loadUploadPresets(),
       ]);
+
+      // Keep the projector state honest: mpv can exit (or be started
+      // from another tab) without this page knowing.
+      this._outputStatusPoll = setInterval(() => this.checkOutputStatus(), OUTPUT_STATUS_MS);
+
+      // Refresh the remote event list while connected so new events
+      // (and finished live ones) show up without a manual Refresh.
+      this._eventsPoll = setInterval(() => {
+        if (this.isConnected && !this.isDiscovering) this.refreshRemoteEvents();
+      }, EVENTS_REFRESH_MS);
 
       // Auto-connect to the encoder if we have a URL; otherwise just
       // populate the local-uploads list so the operator can pick one.
@@ -173,18 +224,22 @@ document.addEventListener("alpine:init", () => {
       if (this.activeCacheEventId) this.pollCacheStatus();
 
       // Auto-reconnect to the last-played stream (if it still exists).
+      // This is NOT a user action: if the projector is already running
+      // we adopt its position instead of pushing ours to it, so a page
+      // reload mid-service never pauses or seeks the projector.
       if (this.savedStreamUrl) {
         const stillValid = await this.validateSavedStream();
         if (stillValid) {
           this.streamUrl = this.savedStreamUrl;
-          this.connectStream();
+          this.connectStream({ adoptHardware: true });
         }
       }
 
-      // Frame-by-frame keyboard shortcuts. Skip when typing in an input
-      // or when the UI is locked.
+      // Frame-by-frame keyboard shortcuts. Skip when focus is on a form
+      // control or button (Space/arrows belong to it) or when locked.
       document.addEventListener("keydown", (e) => {
-        if (e.target?.tagName === "INPUT" || e.target?.tagName === "TEXTAREA") return;
+        const t = e.target;
+        if (t && (["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(t.tagName) || t.isContentEditable)) return;
         if (this.locked) return;
         if (e.key === "ArrowLeft")  { e.preventDefault(); this.frameStep(-1); }
         if (e.key === "ArrowRight") { e.preventDefault(); this.frameStep(1); }
@@ -207,11 +262,14 @@ document.addEventListener("alpine:init", () => {
       this.outputMode     = localStorage.getItem("oc_dec_output_mode")  || "display";
       this.fullscreen     = localStorage.getItem("oc_dec_fullscreen")   !== "0";
       this.decklinkFormat = localStorage.getItem("oc_dec_decklink")     || "720p59.94";
-      this.screenIndex    = parseInt(localStorage.getItem("oc_dec_screen_idx") || "1", 10);
+      // 0 is a valid display index; only fall back on missing/garbage.
+      const idx = parseInt(localStorage.getItem("oc_dec_screen_idx") ?? "1", 10);
+      this.screenIndex    = Number.isInteger(idx) && idx >= 0 ? idx : 1;
       this.browserMuted   = localStorage.getItem("oc_dec_browser_muted") !== "0";
       this.mpvMuted       = localStorage.getItem("oc_dec_mpv_muted")     !== "0";
       this.locked         = localStorage.getItem("oc_dec_locked") === "1";
-      this.uploadQuality  = localStorage.getItem("oc_dec_upload_quality") || "standard";
+      const q = localStorage.getItem("oc_dec_upload_quality") || DEFAULT_UPLOAD_PRESET;
+      this.uploadQuality  = LEGACY_UPLOAD_PRESETS[q] || q;
       this.playbackProfile = localStorage.getItem("oc_dec_playback_profile") || "auto";
     },
 
@@ -239,7 +297,38 @@ document.addEventListener("alpine:init", () => {
         if (!this.playbackProfiles.find(p => p.id === this.playbackProfile)) {
           this.playbackProfile = data.default || "auto";
         }
+        this.resyncSelect("profileSelect", this.playbackProfile);
       } catch (_) {}
+    },
+
+    // loadUploadPresets pulls the tier catalog from this server's
+    // /api/quality (same catalog the encoder uses) and flattens it for
+    // the upload picker.
+    async loadUploadPresets() {
+      try {
+        const data = await this.api("/api/quality");
+        const flat = [];
+        for (const t of (data?.tiers || [])) {
+          for (const p of (t.presets || [])) {
+            flat.push({ id: p.id, label: `${p.label} · ${F.presetSummary(p)}` });
+          }
+        }
+        if (flat.length === 0) return;
+        this.uploadPresets = flat;
+        if (!flat.some(p => p.id === this.uploadQuality)) {
+          this.uploadQuality = (flat.find(p => p.id === DEFAULT_UPLOAD_PRESET) || flat[0]).id;
+        }
+        this.resyncSelect("uploadQualitySelect", this.uploadQuality);
+      } catch (_) {}
+    },
+
+    // resyncSelect re-applies a model value to a <select> after its
+    // <option>s arrive asynchronously (x-model ran before x-for did).
+    resyncSelect(ref, value) {
+      this.$nextTick(() => {
+        const el = this.$refs[ref];
+        if (el && value != null) el.value = String(value);
+      });
     },
 
     // playbackProfileDescription returns the description string for
@@ -262,8 +351,21 @@ document.addEventListener("alpine:init", () => {
       const text = await r.text();
       let data = null;
       if (text) { try { data = JSON.parse(text); } catch (_) { data = { detail: text }; } }
-      if (!r.ok) throw new Error((data && (data.detail || data.error)) || `HTTP ${r.status}`);
+      if (!r.ok) {
+        const err = new Error((data && (data.detail || data.error)) || `HTTP ${r.status}`);
+        err.status = r.status;
+        throw err;
+      }
       return data;
+    },
+
+    // encoderBase returns the normalized remote encoder URL (no trailing
+    // slash), or "" when none is configured.
+    encoderBase() {
+      let url = (this.encoderUrl || "").trim();
+      if (!url) return "";
+      if (!/^https?:\/\//i.test(url)) url = "http://" + url;
+      return url.replace(/\/+$/, "").replace(/\/events\/[^/]+$/, "");
     },
 
     // ============================================================
@@ -272,26 +374,39 @@ document.addEventListener("alpine:init", () => {
     async discoverEvents() {
       if (!this.encoderUrl) { this.error = "Enter the encoder address first."; return; }
 
-      let url = this.encoderUrl.trim();
-      if (!/^https?:\/\//i.test(url)) url = "http://" + url;
-      url = url.replace(/\/$/, "");
+      const url = this.encoderBase();
       this.encoderUrl = url;
 
       this.isDiscovering = true;
       this.error = "";
+      this.connectHint = "";
+      this.remoteIsDecoder = false;
+      this.staleCaches = [];
       this.events = [];
 
       try {
+        // Ask the remote what it is. Pointing the decoder at itself (the
+        // default when DEFAULT_ENCODER_URL is unset) or at another
+        // decoder returns an empty event list, which must not be
+        // mistaken for "the encoder deleted everything".
+        this.remoteIsDecoder = await this.remoteLooksLikeDecoder(url);
+
         const r = await fetch(`${url}/api/events`);
         if (!r.ok) throw new Error(`Connection failed (${r.status})`);
-        this.events = await r.json();
+        const list = await r.json();
+        this.events = Array.isArray(list) ? list : [];
         this.isConnected = true;
         this.connectionOK = true;
 
-        await this.loadCachedEventList();
-        await this.reconcileCache();
+        await Promise.all([this.loadCachedEventList(), this.loadLocalUploads()]);
+        if (!this.remoteIsDecoder) this.computeStaleCaches();
       } catch (e) {
         this.error = `Connection failed: ${e.message}`;
+        if (e instanceof TypeError) {
+          // fetch() rejects with TypeError for network failures and
+          // CORS rejections alike; the latter is the common LAN case.
+          this.connectHint = `Couldn't reach ${url}. If the encoder is running, add ${window.location.origin} to EASYCAMPUS_ALLOWED_ORIGINS on the encoder and restart it.`;
+        }
         this.isConnected = false;
         this.connectionOK = false;
       } finally {
@@ -300,33 +415,66 @@ document.addEventListener("alpine:init", () => {
       }
     },
 
-    // After a successful encoder fetch, remove any local cache for events
-    // the encoder no longer has — but preserve local uploads (which only
-    // live on the decoder and never appear in the encoder's event list).
-    async reconcileCache() {
-      const localUploadIds = new Set();
+    async remoteLooksLikeDecoder(url) {
+      if (url === window.location.origin && this.nodeType === "decoder") return true;
       try {
-        const ups = await this.api("/api/cache/uploads").catch(() => []);
-        (ups || []).forEach(u => localUploadIds.add(u.event_id));
-      } catch (_) {}
-
-      const encoderIds = new Set(this.events.map(e => e.id));
-      const stale = Object.keys(this.cachedEvents)
-        .filter(id => !encoderIds.has(id) && !localUploadIds.has(id));
-
-      for (const id of stale) {
-        delete this.cachedEvents[id];
-        try { await this.api(`/api/cache/${id}`, { method: "DELETE" }); } catch (_) {}
+        const r = await fetch(`${url}/api/config`);
+        if (!r.ok) return false;
+        const cfg = await r.json();
+        return cfg?.NODE_TYPE === "decoder";
+      } catch (_) {
+        return false;
       }
+    },
 
-      // If the saved stream points to a deleted event, drop it.
-      if (this.savedStreamUrl) {
-        const m = this.savedStreamUrl.match(/\/events\/(\d{8}_\d{6}|\d{8}-\d{6})\//);
-        if (m && !encoderIds.has(m[1])) {
-          this.savedStreamUrl = "";
-          this.streamUrl = "";
+    // refreshRemoteEvents is the quiet background refresh: no spinner,
+    // no clearing the list, no error banner on a transient failure.
+    async refreshRemoteEvents() {
+      const url = this.encoderBase();
+      if (!url) return;
+      try {
+        const r = await fetch(`${url}/api/events`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const list = await r.json();
+        this.events = Array.isArray(list) ? list : [];
+        this.connectionOK = true;
+        await Promise.all([this.loadCachedEventList(), this.loadLocalUploads()]);
+        if (!this.remoteIsDecoder) this.computeStaleCaches();
+      } catch (_) {
+        this.connectionOK = false;
+      }
+    },
+
+    // computeStaleCaches lists local caches for events the encoder no
+    // longer has. Nothing is deleted automatically: the operator reviews
+    // the list and clicks "Clear stale caches". Local uploads (decoder
+    // only) and the cache currently playing are never listed.
+    computeStaleCaches() {
+      const localUploadIds = new Set(this.localUploads.map(u => u.event_id));
+      const encoderIds = new Set(this.events.map(e => e.id));
+      this.staleCaches = Object.keys(this.cachedEvents)
+        .filter(id => !encoderIds.has(id) && !localUploadIds.has(id) && id !== this.activeCacheEventId)
+        .sort();
+    },
+
+    async clearStaleCaches() {
+      if (this.locked || this.staleCaches.length === 0) return;
+      const n = this.staleCaches.length;
+      if (!confirm(`Delete ${n} local cache${n === 1 ? "" : "s"} for events the encoder no longer lists?`)) return;
+      this.isClearingStale = true;
+      const failed = [];
+      for (const id of [...this.staleCaches]) {
+        try {
+          await this.api(`/api/cache/${encodeURIComponent(id)}`, { method: "DELETE" });
+          delete this.cachedEvents[id];
+        } catch (_) {
+          failed.push(id);
         }
       }
+      this.staleCaches = failed;
+      this.isClearingStale = false;
+      if (failed.length) this.showToast(`Could not clear ${failed.length} cache(s)`, "bad");
+      else this.showToast("Stale caches cleared", "good");
     },
 
     async loadCachedEventList() {
@@ -390,48 +538,75 @@ document.addEventListener("alpine:init", () => {
     },
 
     async selectEvent(ev) {
-      if (this.locked) return;
-
-      // Local uploads play directly from /cache.
-      if (ev.type === "local_upload") {
-        const url = `${window.location.origin}/cache/${ev.id}/master.m3u8`;
-        this.activeCacheEventId = ev.id;
-        this.usingCache = true;
-        this.streamUrl = url;
-        this.savedStreamUrl = url;
-        this.error = "";
-        await this.maybeUpdateHardware(url);
-        this.connectStream();
-        this.loadBookmarks();
-        return;
-      }
-
-      // Remote events: start a local cache, then point the player at /cache.
-      let base = this.encoderUrl.trim().replace(/\/$/, "");
-      base = base.replace(/\/events\/[^/]+$/, "");
-      this.error = "Starting local cache…";
+      if (this.locked || this.selectingEventId) return;
+      const token = ++this._selectToken;
+      this.selectingEventId = ev.id;
+      this.error = "";
       try {
+        // Local uploads play directly from /cache.
+        if (ev.type === "local_upload") {
+          const url = `${window.location.origin}/cache/${ev.id}/master.m3u8`;
+          this.activeCacheEventId = ev.id;
+          this.usingCache = true;
+          this.streamUrl = url;
+          this.savedStreamUrl = url;
+          await this.maybeUpdateHardware(url);
+          this.connectStream({ userInitiated: true });
+          this.loadBookmarks();
+          return;
+        }
+
+        // Remote events: start a local cache, wait for the first
+        // segment, then point the player at /cache.
+        const base = this.encoderBase();
+        this.statusLine = "Starting local cache…";
         await this.api("/api/cache/start", { method: "POST", body: { event_id: ev.id, remote_url: base } });
         this.activeCacheEventId = ev.id;
         this.usingCache = true;
         this.pollCacheStatus();
-        // Give the cache a beat to fill the first few segments.
-        await new Promise(r => setTimeout(r, 1000));
+
+        this.statusLine = "Waiting for the first cached segment…";
+        const ready = await this.waitForCacheSegments(ev.id, token);
+        if (token !== this._selectToken) return;   // superseded
+        if (!ready) {
+          this.statusLine = "No segments cached yet. Trying to play anyway…";
+        }
 
         const local = `${window.location.origin}/cache/${ev.id}/master.m3u8`;
         this.streamUrl = local;
         this.savedStreamUrl = local;
-        this.error = "";
 
         await this.maybeUpdateHardware(local);
-        this.connectStream();
+        this.connectStream({ userInitiated: true, keepStatus: !ready });
         this.loadBookmarks();
       } catch (e) {
+        this.statusLine = "";
         this.error = `Cache failed: ${e.message}`;
+      } finally {
+        if (token === this._selectToken) this.selectingEventId = null;
       }
     },
 
+    // waitForCacheSegments polls /cache/{id}/status (CacheStatus:
+    // cached, active, segments, size_bytes) until at least one segment
+    // has landed, the timeout passes, or a newer selection supersedes
+    // this one.
+    async waitForCacheSegments(id, token) {
+      const deadline = Date.now() + CACHE_READY_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        if (token !== this._selectToken) return false;
+        const st = await this.api(`/api/cache/${encodeURIComponent(id)}/status`).catch(() => null);
+        if (st && st.segments > 0) {
+          this.cacheStatus = st;
+          return true;
+        }
+        await sleep(500);
+      }
+      return false;
+    },
+
     async deleteCache(ev) {
+      if (this.locked) return;
       const label = ev.type === "local_upload" ? "local upload" : "local cache";
       if (!confirm(`Delete ${label} for "${ev.name}"?`)) return;
       try {
@@ -441,15 +616,39 @@ document.addEventListener("alpine:init", () => {
           this.allEvents = this.allEvents.filter(e => e.id !== ev.id);
           this.localUploads = this.localUploads.filter(u => u.event_id !== ev.id);
         }
-        if (this.activeCacheEventId === ev.id) {
-          this.activeCacheEventId = null;
-          this.streamUrl = "";
-          this.savedStreamUrl = "";
-        }
+        if (this.activeCacheEventId === ev.id) this.teardownPlayer();
         this.showToast("Cache cleared", "good");
       } catch (e) {
         this.showToast(e.message, "bad");
       }
+    },
+
+    // teardownPlayer stops playback of the active cache and clears every
+    // timer tied to it. Used when the cache being played is deleted.
+    teardownPlayer() {
+      if (this._cachePoll) { clearInterval(this._cachePoll); this._cachePoll = null; }
+      if (this._statsInterval) { clearInterval(this._statsInterval); this._statsInterval = null; }
+      clearTimeout(this._netRetryTimer);
+      this._netRetryTimer = null;
+      if (this.player) { try { this.player.destroy(); } catch (_) {} this.player = null; }
+      const v = this.$refs.videoPlayer;
+      if (v) { v.pause(); v.removeAttribute("src"); v.load(); }
+      this.activeCacheEventId = null;
+      this.usingCache = false;
+      this.streamUrl = "";
+      this.savedStreamUrl = "";
+      this.hasPlayed = false;
+      this.isReady = false;
+      this.isPlaying = false;
+      this.isLive = false;
+      this.atLiveEdge = false;
+      this.currentTime = 0;
+      this.duration = 0;
+      this.bookmarks = [];
+      this.statusLine = "";
+      this.cacheStatus = { cached: false, active: false, segments: 0, size_bytes: 0 };
+      this.totalSegments = 0;
+      this.cacheProgress = 0;
     },
 
     pollCacheStatus() {
@@ -476,7 +675,7 @@ document.addEventListener("alpine:init", () => {
       const ev = this.allEvents.find(e => e.id === this.activeCacheEventId);
       if (ev && ev.type === "local_upload") return;
       try {
-        const base = this.encoderUrl.trim().replace(/\/$/, "");
+        const base = this.encoderBase();
         const url = `${base}/events/${this.activeCacheEventId}/master.m3u8`;
         const r = await fetch(url);
         if (!r.ok) return;
@@ -503,11 +702,25 @@ document.addEventListener("alpine:init", () => {
     // ============================================================
     // PLAYER
     // ============================================================
-    connectStream() {
+    // connectStream attaches the in-page player to this.streamUrl.
+    //   userInitiated: the operator picked this stream, so it's fine to
+    //                  align the projector to the browser afterwards.
+    //   adoptHardware: page (re)load. Never push state to mpv; instead
+    //                  pull mpv's position and follow it.
+    //   retry:         internal re-attach after a manifest load error.
+    connectStream(opts = {}) {
+      const { userInitiated = false, adoptHardware = false, retry = false, keepStatus = false } = opts;
       if (!this.streamUrl) return;
-      this.error = "";
+      if (!retry) {
+        this.error = "";
+        this._netRetries = 0;
+        if (!keepStatus) this.statusLine = "";
+      }
+      clearTimeout(this._netRetryTimer);
+      this._netRetryTimer = null;
       this.isReady = false;
       this.isLive = false;
+      this.atLiveEdge = false;
 
       const video = this.$refs.videoPlayer;
       if (!video) return;
@@ -516,9 +729,11 @@ document.addEventListener("alpine:init", () => {
       // Tear down any prior player.
       if (this.player) { try { this.player.destroy(); } catch (_) {} this.player = null; }
 
-      // Wire <video> events.
-      video.onplay  = () => { this.isPlaying = true;  this.syncHardware("play"); };
-      video.onpause = () => { this.isPlaying = false; this.syncHardware("pause"); };
+      // Wire <video> events. play/pause mirror to mpv only when they
+      // weren't caused by us adopting mpv's own state.
+      const echo = (cmd) => { if (Date.now() >= this._suppressHwUntil) this.syncHardware(cmd); };
+      video.onplay  = () => { this.isPlaying = true;  echo("play"); };
+      video.onpause = () => { this.isPlaying = false; echo("pause"); };
       video.onseeked = () => { this.currentTime = video.currentTime; };
       video.ontimeupdate = () => { if (!this.seeking) this.currentTime = video.currentTime; };
       video.onloadedmetadata = () => {
@@ -536,36 +751,57 @@ document.addEventListener("alpine:init", () => {
         hls.loadSource(this.streamUrl);
         hls.attachMedia(video);
         hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
-          this.isConnected = true;
+          this._netRetries = 0;
+          this.statusLine = "";
           this.hasPlayed = true;
           const lvl = data.levels?.[0]?.details;
           this.isLive = lvl ? !!lvl.live : false;
           this.duration = isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
           if (this.isLive) {
-            const liveEdge = video.seekable.length > 0 ? video.seekable.end(0) : this.duration;
+            const liveEdge = video.seekable.length > 0 ? video.seekable.end(video.seekable.length - 1) : this.duration;
             video.currentTime = Math.max(0, liveEdge - 5);
           } else {
             video.currentTime = 0;
           }
           this.currentTime = video.currentTime;
-          video.pause();
-          this.isPlaying = false;
-          if (this.hardwareActive) {
+          this.isPlaying = !video.paused;
+
+          if (!this.hardwareActive) return;
+          if (adoptHardware) {
+            // Reload path: follow the projector, don't steer it.
+            this.adoptHardwarePosition().finally(() => this.startHardwareSync());
+          } else if (userInitiated) {
+            // Operator just picked this stream: align mpv to the browser.
             setTimeout(() => { this.syncHardware("seek"); this.syncHardware("pause"); }, 500);
           }
         });
+        hls.on(Hls.Events.LEVEL_LOADED, (_e, data) => {
+          if (data?.details) this.isLive = !!data.details.live;
+        });
+        hls.on(Hls.Events.FRAG_LOADED, () => {
+          if (this._netRetries) { this._netRetries = 0; this.statusLine = ""; }
+        });
         hls.on(Hls.Events.ERROR, (_e, data) => {
           if (!data.fatal) return;
-          if (data.type === Hls.ErrorTypes.NETWORK_ERROR)        hls.startLoad();
-          else if (data.type === Hls.ErrorTypes.MEDIA_ERROR)     hls.recoverMediaError();
-          else { try { hls.destroy(); } catch (_) {} this.player = null; this.error = `Playback error: ${data.type}`; }
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            this.scheduleNetworkRetry(hls, data, opts);
+          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            hls.recoverMediaError();
+          } else {
+            try { hls.destroy(); } catch (_) {}
+            if (this.player === hls) this.player = null;
+            this.statusLine = "";
+            this.error = `Playback error: ${data.details || data.type}`;
+          }
         });
         this.player = hls;
       } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
         video.src = this.streamUrl;
         video.addEventListener("loadedmetadata", () => {
-          this.isConnected = true;
           this.hasPlayed = true;
+          if (this.hardwareActive && adoptHardware) {
+            this.adoptHardwarePosition().finally(() => this.startHardwareSync());
+          }
         }, { once: true });
       } else {
         this.error = "This browser does not support HLS playback.";
@@ -574,11 +810,66 @@ document.addEventListener("alpine:init", () => {
       this.startStats();
     },
 
+    // scheduleNetworkRetry: fatal network errors back off exponentially
+    // (1 s, 2 s, 4 s … capped at 15 s) and give up after HLS_MAX_RETRIES.
+    // A failed manifest load destroys and re-attaches the player; other
+    // network errors restart loading on the existing instance.
+    scheduleNetworkRetry(hls, data, opts) {
+      if (this.player !== hls) return;
+      if (this._netRetries >= HLS_MAX_RETRIES) {
+        try { hls.destroy(); } catch (_) {}
+        this.player = null;
+        this.statusLine = "";
+        this.error = "Stream unavailable. Check the encoder and select the event again.";
+        return;
+      }
+      const delay = Math.min(1000 * 2 ** this._netRetries, 15000);
+      this._netRetries++;
+      this.statusLine = "Waiting for stream…";
+      const manifestFailed = [
+        Hls.ErrorDetails.MANIFEST_LOAD_ERROR,
+        Hls.ErrorDetails.MANIFEST_LOAD_TIMEOUT,
+      ].includes(data.details);
+      clearTimeout(this._netRetryTimer);
+      this._netRetryTimer = setTimeout(() => {
+        if (this.player !== hls) return;
+        if (manifestFailed) this.connectStream({ ...opts, retry: true });
+        else hls.startLoad();
+      }, delay);
+    },
+
+    // adoptHardwarePosition seeks the browser to where mpv is (and plays
+    // if mpv is playing) without echoing anything back to mpv.
+    async adoptHardwarePosition() {
+      const data = await this.api("/api/output/frame-position").catch(() => null);
+      const v = this.$refs.videoPlayer;
+      if (!data || !v || data.time_pos == null) return;
+      let t = Number(data.time_pos);
+      if (!Number.isFinite(t)) return;
+      if (v.seekable.length > 0) {
+        t = Math.max(v.seekable.start(0), Math.min(t, v.seekable.end(v.seekable.length - 1)));
+      }
+      this._suppressHwUntil = Date.now() + 2000;
+      this._lastSeekTime = Date.now();
+      v.currentTime = t;
+      this.currentTime = t;
+      if (data.paused === false && v.paused) {
+        // May be refused by autoplay policy if browser audio is on;
+        // the projector keeps playing either way.
+        v.play().catch(() => {});
+      }
+    },
+
     async connectManualStream() {
+      if (this.locked || !this.streamUrl) return;
       this.savedStreamUrl = this.streamUrl;
-      this.usingCache = this.streamUrl.includes(window.location.origin);
+      const m = this.streamUrl.match(/\/cache\/([^/]+)\/master\.m3u8/);
+      this.usingCache = !!m && this.streamUrl.startsWith(window.location.origin);
+      this.activeCacheEventId = this.usingCache ? m[1] : null;
+      if (this.usingCache) this.pollCacheStatus();
+      else if (this._cachePoll) { clearInterval(this._cachePoll); this._cachePoll = null; }
       await this.maybeUpdateHardware(this.streamUrl);
-      this.connectStream();
+      this.connectStream({ userInitiated: true });
     },
 
     startStats() {
@@ -588,6 +879,7 @@ document.addEventListener("alpine:init", () => {
         if (!v) return;
         if (v.buffered.length > 0) this.bufferLen = v.buffered.end(v.buffered.length - 1) - v.currentTime;
         this.resolution = v.videoWidth ? `${v.videoWidth}×${v.videoHeight}` : "—";
+        this.updateLiveEdge(v);
         if (this.isLive && this.isConnected) {
           const now = Date.now();
           if (!this._lastBookmarkPoll || now - this._lastBookmarkPoll > 5000) {
@@ -596,6 +888,32 @@ document.addEventListener("alpine:init", () => {
           }
         }
       }, 1000);
+    },
+
+    // updateLiveEdge: the LIVE badge only shows when the playhead is
+    // within ~2 target durations of the live edge.
+    updateLiveEdge(v) {
+      if (!this.isLive || !v || v.seekable.length === 0) { this.atLiveEdge = false; return; }
+      const hls = this.player;
+      const lvl = hls?.levels?.[Math.max(0, hls.currentLevel)]?.details;
+      const target = lvl?.targetduration || 6;
+      const edge = v.seekable.end(v.seekable.length - 1);
+      this.atLiveEdge = (edge - v.currentTime) <= target * 2;
+    },
+
+    goLive() {
+      if (this.locked) return;
+      const v = this.$refs.videoPlayer;
+      if (!v) return;
+      let t = this.player?.liveSyncPosition;
+      if (!Number.isFinite(t) && v.seekable.length > 0) t = v.seekable.end(v.seekable.length - 1) - 3;
+      if (!Number.isFinite(t)) return;
+      this.seekTo(t);
+      this.atLiveEdge = true;
+    },
+
+    currentFps() {
+      return F.eventFps(this.allEvents.find(e => e.id === this.activeCacheEventId));
     },
 
     togglePlay() {
@@ -618,9 +936,8 @@ document.addEventListener("alpine:init", () => {
     },
 
     frameStep(direction) {
-      // 30 fps is the safe assumption for HLS segments; if we wired
-      // backend FPS through to the event payload we'd use it here.
-      this.seekTo(this.currentTime + (direction / 30));
+      // EventInfo.fps when the encoder reports it; 30 otherwise.
+      this.seekTo(this.currentTime + (direction / this.currentFps()));
     },
 
     gotoTimeNow() {
@@ -633,7 +950,7 @@ document.addEventListener("alpine:init", () => {
       const v = this.$refs.videoPlayer;
       if (!v || this.locked) return;
       if (this.isLive && v.seekable.length > 0) {
-        time = Math.max(v.seekable.start(0), Math.min(time, v.seekable.end(0)));
+        time = Math.max(v.seekable.start(0), Math.min(time, v.seekable.end(v.seekable.length - 1)));
       } else {
         time = Math.max(0, Math.min(time, this.duration || time));
       }
@@ -671,6 +988,7 @@ document.addEventListener("alpine:init", () => {
     },
 
     async toggleMPVMute() {
+      if (this.locked) return;
       this.mpvMuted = !this.mpvMuted;
       try {
         await this.api("/api/output/mute", { method: "POST", body: { muted: this.mpvMuted } });
@@ -680,11 +998,23 @@ document.addEventListener("alpine:init", () => {
     // ============================================================
     // HARDWARE OUTPUT (mpv)
     // ============================================================
+    // checkOutputStatus runs at init and every OUTPUT_STATUS_MS. It
+    // reconciles hardwareActive with mpv's real state (mpv may have
+    // exited, or been started from another tab) and keeps the drift
+    // poll running only while mpv is up.
     async checkOutputStatus() {
-      try {
-        const data = await this.api("/api/output/status").catch(() => null);
-        if (data) this.hardwareActive = !!data.is_running;
-      } catch (_) {}
+      if (this.isTogglingHardware) return;
+      const data = await this.api("/api/output/status").catch(() => null);
+      if (!data || this.isTogglingHardware) return;
+      const running = !!data.is_running;
+      if (running === this.hardwareActive) return;
+      this.hardwareActive = running;
+      if (running) {
+        this.startHardwareSync();
+      } else if (this._hwSyncPoll) {
+        clearInterval(this._hwSyncPoll);
+        this._hwSyncPoll = null;
+      }
     },
 
     async refreshOutputCapabilities() {
@@ -702,6 +1032,8 @@ document.addEventListener("alpine:init", () => {
               !this.capabilities.decklink.formats.includes(this.decklinkFormat)) {
             this.decklinkFormat = this.capabilities.decklink.formats[0];
           }
+          this.resyncSelect("screenSelect", this.screenIndex);
+          this.resyncSelect("decklinkSelect", this.decklinkFormat);
         }
       } finally {
         this.isRefreshingCapabilities = false;
@@ -728,31 +1060,47 @@ document.addEventListener("alpine:init", () => {
     },
 
     async toggleHardware() {
-      if (this.locked) return;
-      if (this.hardwareActive) {
-        try { await this.api("/api/output/stop", { method: "POST" }); } catch (_) {}
-        this.hardwareActive = false;
-        if (this._hwSyncPoll) { clearInterval(this._hwSyncPoll); this._hwSyncPoll = null; }
-        this.showToast("Projector stopped", "good");
-        return;
-      }
-      if (!this.streamUrl) { this.showToast("Pick an event first.", "bad"); return; }
+      if (this.locked || this.isTogglingHardware) return;
+      this.isTogglingHardware = true;
       try {
-        await this.api("/api/output/start", {
-          method: "POST",
-          body: {
-            url: this.streamUrl,
-            screen_index: this.screenIndex,
-            output_mode: this.outputMode,
-            fullscreen: this.fullscreen,
-            decklink_format: this.decklinkFormat,
-            playback_profile: this.playbackProfile,
-          },
-        });
+        if (this.hardwareActive) {
+          try {
+            await this.api("/api/output/stop", { method: "POST" });
+          } catch (e) {
+            // Keep hardwareActive: we don't know that mpv stopped.
+            this.showToast(`Stop failed: ${e.message}`, "bad");
+            return;
+          }
+          this.hardwareActive = false;
+          if (this._hwSyncPoll) { clearInterval(this._hwSyncPoll); this._hwSyncPoll = null; }
+          this.showToast("Projector stopped", "good");
+          return;
+        }
+        if (!this.streamUrl) { this.showToast("Pick an event first.", "bad"); return; }
+        try {
+          await this.api("/api/output/start", {
+            method: "POST",
+            body: {
+              url: this.streamUrl,
+              screen_index: this.screenIndex,
+              output_mode: this.outputMode,
+              fullscreen: this.fullscreen,
+              decklink_format: this.decklinkFormat,
+              playback_profile: this.playbackProfile,
+            },
+          });
+        } catch (e) {
+          this.error = `Hardware output failed: ${e.message}`;
+          this.showToast(this.error, "bad");
+          return;
+        }
         this.hardwareActive = true;
+        // mpv always starts muted; reflect that rather than whatever
+        // localStorage remembered from a previous session.
+        this.mpvMuted = true;
         this.showToast("Projector starting…", "good");
         // Give mpv ~1s to come up, then push the browser's current
-        // position so they start in sync.
+        // position so they start in sync. This is a user action.
         setTimeout(async () => {
           const v = this.$refs.videoPlayer;
           if (v && v.currentTime > 0) {
@@ -761,9 +1109,8 @@ document.addEventListener("alpine:init", () => {
           }
           this.startHardwareSync();
         }, 1000);
-      } catch (e) {
-        this.error = `Hardware output failed: ${e.message}`;
-        this.showToast(this.error, "bad");
+      } finally {
+        this.isTogglingHardware = false;
       }
     },
 
@@ -824,22 +1171,36 @@ document.addEventListener("alpine:init", () => {
     // ============================================================
     // BOOKMARKS
     // ============================================================
+    // Encoder bookmarks live on the remote encoder, so they're read from
+    // ${encoderUrl}/api/events/{id}/bookmarks (the decoder's own store is
+    // always empty). Decoder bookmarks are device-local (localStorage);
+    // the decoder never writes to the encoder's bookmark store.
     async loadBookmarks() {
-      if (!this.activeCacheEventId) { this.bookmarks = []; return; }
-      const decoderKey = `oc_dec_bookmarks_${this.activeCacheEventId}`;
-      const decoderBookmarks = JSON.parse(localStorage.getItem(decoderKey) || "[]");
+      const id = this.activeCacheEventId;
+      if (!id) { this.bookmarks = []; return; }
+      const decoderKey = `oc_dec_bookmarks_${id}`;
+      let decoderBookmarks = [];
+      try { decoderBookmarks = JSON.parse(localStorage.getItem(decoderKey) || "[]"); } catch (_) {}
       let encoderBookmarks = [];
-      try {
-        const data = await this.api(`/api/events/${this.activeCacheEventId}/bookmarks`).catch(() => null);
-        encoderBookmarks = data?.bookmarks || [];
-      } catch (_) {}
+      const base = this.encoderBase();
+      const ev = this.allEvents.find(e => e.id === id);
+      if (base && !(ev && ev.type === "local_upload")) {
+        try {
+          const r = await fetch(`${base}/api/events/${encodeURIComponent(id)}/bookmarks`);
+          if (r.ok) {
+            const data = await r.json();
+            encoderBookmarks = (data?.bookmarks || []).map(b => ({ ...b, source: "encoder" }));
+          }
+        } catch (_) {}
+      }
+      if (id !== this.activeCacheEventId) return;   // switched events mid-fetch
       this.bookmarks = [...decoderBookmarks, ...encoderBookmarks].sort((a, b) => (a.frame || 0) - (b.frame || 0));
     },
 
     async createBookmark() {
       const v = this.$refs.videoPlayer;
-      if (!v || !this.activeCacheEventId) return;
-      const fps = 30;
+      if (!v || !this.activeCacheEventId || this.locked) return;
+      const fps = this.currentFps();
       const frame = Math.round(v.currentTime * fps);
       const bm = {
         id: `bm_dec_${Date.now()}`,
@@ -851,7 +1212,8 @@ document.addEventListener("alpine:init", () => {
         color: "orange",
       };
       const key = `oc_dec_bookmarks_${this.activeCacheEventId}`;
-      const existing = JSON.parse(localStorage.getItem(key) || "[]");
+      let existing = [];
+      try { existing = JSON.parse(localStorage.getItem(key) || "[]"); } catch (_) {}
       existing.push(bm);
       localStorage.setItem(key, JSON.stringify(existing));
       this.newBookmarkName = "";
@@ -859,22 +1221,25 @@ document.addEventListener("alpine:init", () => {
     },
 
     deleteBookmark(bm) {
+      if (this.locked) return;
       if (bm.source === "encoder") {
         this.showToast("Encoder bookmarks can only be removed from the encoder.", "bad");
         return;
       }
       const key = `oc_dec_bookmarks_${this.activeCacheEventId}`;
-      const existing = JSON.parse(localStorage.getItem(key) || "[]");
+      let existing = [];
+      try { existing = JSON.parse(localStorage.getItem(key) || "[]"); } catch (_) {}
       localStorage.setItem(key, JSON.stringify(existing.filter(b => b.id !== bm.id)));
       this.loadBookmarks();
     },
 
     async jumpToBookmark(bm) {
+      if (this.locked) return;
       // Frame-precise: seek both browser and mpv to the exact frame.
-      let t = bm.time_pos != null ? bm.time_pos : (bm.frame || 0) / (bm.fps || 30);
+      let t = bm.time_pos != null ? bm.time_pos : (bm.frame || 0) / (bm.fps || this.currentFps());
       const v = this.$refs.videoPlayer;
       if (this.isLive && v && v.seekable.length > 0) {
-        t = Math.max(v.seekable.start(0), Math.min(t, v.seekable.end(0)));
+        t = Math.max(v.seekable.start(0), Math.min(t, v.seekable.end(v.seekable.length - 1)));
       }
       if (v) { v.currentTime = t; this.currentTime = t; }
       this._lastSeekTime = Date.now();
@@ -901,7 +1266,7 @@ document.addEventListener("alpine:init", () => {
 
       try {
         const r = await fetch("/api/cache/upload", { method: "POST", body: fd });
-        if (!r.ok) throw new Error(await r.text() || `HTTP ${r.status}`);
+        if (!r.ok) throw new Error(F.errorDetail(await r.text(), r.status));
         const data = await r.json();
         this.uploadEventId = data.event_id;
         this.uploadStatus = "Processing…";
@@ -916,46 +1281,42 @@ document.addEventListener("alpine:init", () => {
     },
 
     async pollCacheUploadStatus(eventId) {
+      // Tolerate a few 404s (status file not written yet), then stop.
+      let notFound = 0;
       const tick = async () => {
+        let data;
         try {
-          const data = await this.api(`/api/cache/upload/${eventId}/status`).catch(() => null);
-          if (!data) { setTimeout(tick, 2000); return; }
-          if (data.status === "completed") {
-            this.uploadStatus = "Ready";
-            this.uploadProgress = 100;
+          data = await this.api(`/api/cache/upload/${eventId}/status`);
+        } catch (e) {
+          if (e.status === 404 && ++notFound >= UPLOAD_404_LIMIT) {
+            this.uploadStatus = "Failed";
             this.isUploading = false;
-            this.loadLocalUploads();
-            setTimeout(() => { this.uploadStatus = ""; this.uploadProgress = 0; }, 3000);
+            this.showToast("Upload status not found. The upload may have been removed.", "bad");
             return;
           }
-          if (data.status === "failed") {
-            this.uploadStatus = "Processing failed";
-            this.isUploading = false;
-            this.showToast("Video processing failed", "bad");
-            return;
-          }
-          this.uploadStatus = "Processing video…";
-          this.uploadProgress = Math.min(data.progress || 0, 95);
           setTimeout(tick, 2000);
-        } catch (_) { setTimeout(tick, 2000); }
+          return;
+        }
+        notFound = 0;
+        if (data?.status === "completed") {
+          this.uploadStatus = "Ready";
+          this.uploadProgress = 100;
+          this.isUploading = false;
+          this.loadLocalUploads();
+          setTimeout(() => { this.uploadStatus = ""; this.uploadProgress = 0; }, 3000);
+          return;
+        }
+        if (data?.status === "failed") {
+          this.uploadStatus = "Processing failed";
+          this.isUploading = false;
+          this.showToast("Video processing failed", "bad");
+          return;
+        }
+        this.uploadStatus = "Processing video…";
+        this.uploadProgress = Math.min(data?.progress || 0, 95);
+        setTimeout(tick, 2000);
       };
       tick();
-    },
-
-    async deleteLocalUpload(u) {
-      if (!confirm(`Delete "${u.name}"?`)) return;
-      try {
-        await this.api(`/api/cache/${u.event_id}`, { method: "DELETE" });
-        this.localUploads = this.localUploads.filter(x => x.event_id !== u.event_id);
-        this.allEvents = this.allEvents.filter(e => e.id !== u.event_id);
-        if (this.streamUrl.includes(u.event_id)) {
-          this.streamUrl = "";
-          this.savedStreamUrl = "";
-        }
-        this.showToast("Upload deleted", "good");
-      } catch (e) {
-        this.showToast(e.message, "bad");
-      }
     },
 
     // ============================================================

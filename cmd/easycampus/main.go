@@ -36,26 +36,27 @@ func main() {
 
 	logger := buildLogger()
 
-	settings := app.LoadConfig(logger)
-
-	// --set-type writes the chosen value to ~/.easycampus/config.yaml
-	// and exits without starting the daemon. Matches the pre-refactor
-	// behaviour the deployment scripts depend on.
+	// --set-type rewrites node_type in ~/.easycampus/config.yaml and
+	// exits without starting the daemon. It edits the raw file only:
+	// environment overrides and derived paths are never persisted.
+	// Matches the pre-refactor behaviour the deployment scripts depend on.
 	if *setType != "" {
-		nodeType := strings.ToLower(*setType)
+		nodeType := strings.ToLower(strings.TrimSpace(*setType))
 		if nodeType != "encoder" && nodeType != "decoder" {
 			logger.Error("invalid --set-type value (expected encoder|decoder)",
 				"received", *setType)
 			os.Exit(2)
 		}
-		settings.NodeType = nodeType
-		if err := app.SaveConfig(settings); err != nil {
-			logger.Error("save config failed", "err", err)
+		path, err := app.SetNodeType(nodeType)
+		if err != nil {
+			logger.Error("save config failed", "path", path, "err", err)
 			os.Exit(1)
 		}
-		logger.Info("config updated", "node_type", nodeType)
+		logger.Info("config updated", "path", path, "node_type", nodeType)
 		return
 	}
+
+	settings := app.LoadConfig(logger)
 
 	if err := app.EnsureDirs(settings); err != nil {
 		logger.Error("init dirs failed", "err", err)
@@ -133,4 +134,3 @@ func parseLogLevel(s string) slog.Level {
 	fmt.Fprintf(os.Stderr, "warning: unknown LOG_LEVEL %q, defaulting to info\n", s)
 	return slog.LevelInfo
 }
-

@@ -21,10 +21,10 @@ divides the display refresh — 30 fps on a 60 Hz monitor is a clean 1:2
 duplication, no judder. It breaks down in two scenarios:
 
 1. **Cinema content (24 fps) on a non-multiple refresh rate.** A 30 Hz
-   projector receiving 24 fps frame-doubles unevenly: out of every five
-   source frames, one gets shown for 2 display frames and four get
-   shown for 1 display frame each (the 1:2-1:1-1:1-1:1 pattern). The
-   eye sees this as judder during slow pans.
+   projector receiving 24 fps frame-doubles unevenly: every 4 source
+   frames fill 5 display frames, so one frame in four is shown twice
+   and the other three once (a 2-1-1-1 pattern). The eye sees this as
+   judder during slow pans.
 2. **SDI broadcast output.** Decklink cards lock to a SMPTE-derived
    clock and want frames delivered at the card's rate, not the
    display's. Software interpolation on top would introduce phase
@@ -44,7 +44,7 @@ hardware decode.
 | `projector-60`         | gpu       | display-resample | no     | 60                     | auto    | 60Hz projector.                       |
 | `tv-60`                | gpu       | display-resample | no     | 60                     | auto    | US/JP consumer TVs.                   |
 | `tv-50-pal`            | gpu       | display-resample | **yes**| 50                     | auto    | UK/EU 50Hz TVs.                       |
-| `decklink-broadcast`   | decklink  | display-vdrop    | no     | *(not set)*            | **no**  | SDI / broadcast.                      |
+| `decklink-broadcast`   | decklink  | display-vdrop    | no     | *(not set)*            | **no**  | SDI / broadcast. **Unavailable** (see below). |
 
 ### `auto`
 
@@ -80,10 +80,10 @@ and there's no motion-compensation work.
 ### `projector-30`
 
 **The user's exact case.** 30Hz projector receiving 24 fps cinema
-content. Naive 24→30 frame-doubling produces the 1-2-1-2-1-3 pattern
-(four out of five source frames shown for one display frame, one shown
-for two display frames) and the resulting cadence judders visibly on
-slow pans and dolly shots.
+content. Naive 24→30 frame-doubling produces a 2-1-1-1 pattern (every
+4 source frames fill 5 display frames: one is shown for two display
+frames, the other three for one each) and the resulting cadence
+judders visibly on slow pans and dolly shots.
 
 `--interpolation=yes` is the fix: mpv synthesizes intermediate frames
 so the on-screen motion is smooth at 30Hz even though the source is
@@ -103,17 +103,19 @@ keeps the decode itself cheap.
   detecting the cut and skipping interpolation for that frame.
 - If the projector is actually 30Hz but advertises 60Hz over EDID,
   `--display-fps-override=30` is load-bearing — without it mpv will
-  resample to 60 and you'll still see the 24→60 cadence (which 60Hz
-  handles cleanly, so it's not a disaster, but the override matches
-  the actual panel).
+  time frames for 60Hz (24→60 is 3:2 pulldown) while the panel actually
+  refreshes at 30, so the cadence mpv computes won't match what is
+  displayed. The override matches the actual panel.
 
 ### `projector-60`
 
-60Hz projector receiving 24 fps cinema. Unlike 24→30, the 24→60
-relationship is a clean 2.5× resample that mpv handles smoothly via
-`--video-sync=display-resample` alone — no interpolation needed.
-60Hz panels also handle 30→60 (clean 2×) and 60→60 (identity) without
-trouble.
+60Hz projector. 30→60 (clean 2×) and 60→60 (identity) are smooth with
+`--video-sync=display-resample` alone. 24→60 is **not** clean: 60/24 =
+2.5, so source frames alternate between 3 and 2 display frames (3:2
+pulldown). The cadence is regular but still judders on slow pans, and
+this profile does not enable interpolation to hide it. For cinema
+content, prefer switching the display to a 24Hz mode and using
+`projector-24`; otherwise accept the 3:2 judder.
 
 **CPU impact:** very low. No interpolation; resampling at 60Hz is the
 common path and mpv's optimisation focus.
@@ -145,11 +147,12 @@ from further back, where judder is more visible).
 UK / EU consumer TVs at 50Hz. The defining problem is that almost no
 source rate evenly divides 50:
 
-- 24 → 50 is 1:2-1:2-1:2-1:2-1:3 repeating (one frame in five shown
-  for 3 display frames; the rest for 2). Judder is unavoidable
-  without interpolation.
-- 30 → 50 is 3:5 — every two source frames take five display frames,
-  producing a similar cadence problem.
+- 24 → 50: every 12 source frames fill 25 display frames, so eleven
+  are shown for 2 display frames and one is held for 3. That one
+  3-frame hold per 12 source frames (twice a second) is visible
+  judder without interpolation.
+- 30 → 50: every 3 source frames fill 5 display frames (a 2-2-1
+  pattern), producing an uneven cadence on motion.
 - 25 → 50 is the only clean case (1:2), but 25 fps sources are rare
   outside legacy PAL broadcast.
 
@@ -165,6 +168,13 @@ cost.
   custom 25-on-50 profile if this becomes a frequent deployment.
 
 ### `decklink-broadcast`
+
+**Status: unavailable.** Upstream mpv ships no `decklink` video output
+and no `--decklink-format` option, so this profile only works with a
+custom mpv build. It is kept in the catalog for reference but is marked
+`Unavailable`, excluded from `All()`, and `/output/start` refuses it
+with a 400. SDI output will need to be routed through `ffmpeg -f
+decklink` instead. The description below is the intended design.
 
 For SDI output to a Blackmagic Decklink card. Three things change vs
 the desktop profiles:
@@ -211,7 +221,7 @@ source content's frame rate.
 | 24Hz    | `projector-24` | (not recommended; pick a 60Hz display) | (not recommended) |
 | 30Hz    | `projector-30` (interp ON) | `auto` | (not recommended) |
 | 50Hz    | `tv-50-pal` (interp ON) | `tv-50-pal` (interp ON) | (not recommended; pick 60Hz) |
-| 60Hz    | `projector-60` or `tv-60` | `tv-60` | `tv-60` |
+| 60Hz    | `projector-60` or `tv-60` (3:2 pulldown judder; prefer a 24Hz mode with `projector-24`) | `tv-60` | `tv-60` |
 | SDI     | `decklink-broadcast` | `decklink-broadcast` | `decklink-broadcast` |
 
 When unsure, leave the profile on `auto` — it preserves the prior
@@ -222,12 +232,12 @@ behaviour and you can switch once you've observed actual playback.
 ### HTTP endpoint
 
 ```
-GET /api/playback-profiles
+GET /playback-profiles   (also /api/playback-profiles)
 
 {
   "profiles": [
     {"id":"auto","label":"Auto","description":"...",
-     "video_sync":"audio","interpolation":false,
+     "video_sync":"","interpolation":false,
      "display_fps_override":0,"hwdec":"auto",
      "output_mode":"gpu"},
     ...

@@ -28,7 +28,10 @@ HDMI capture, on-board audio.
 | `consumer-720p30`      | 1280×720    | 30  | 3.5 Mbps | 5.5 Mbps   |
 | `consumer-1080p30`     | 1920×1080   | 30  | 6.0 Mbps | 8.5 Mbps   |
 
-**Rate control:** VBR with a 33% headroom ceiling and a 2-second VBV.
+**Rate control:** VBR. The `-maxrate` ceiling sits 33% above target
+on 480p30 (1.5 → 2.0 Mbps), 29% on 720p30 (3.5 → 4.5 Mbps) and 25% on
+1080p30 (6.0 → 7.5 Mbps). `-bufsize` is 2× the target bitrate (about
+two seconds of buffer at the target rate).
 VBR lets the encoder spend bits where the picture needs them and saves
 bits during static scenes — important on a residential uplink that
 fluctuates with the rest of the household.
@@ -66,8 +69,10 @@ VideoToolbox first because the Mac mini is the modal consumer rig.
 | `prosumer-1080p30-high`  | 1920×1080  | 30  | 9 Mbps   | 11 Mbps    |
 | `prosumer-1080p60`       | 1920×1080  | 60  | 12 Mbps  | 14.5 Mbps  |
 
-**Rate control:** VBR, same envelope shape as consumer but at higher
-target rates. NVENC defaults to `-rc vbr` on this tier.
+**Rate control:** VBR with a tighter ceiling than consumer: `-maxrate`
+is 1 Mbps above target, i.e. 17% headroom on 720p60 (6 → 7 Mbps), 11%
+on 1080p30-high (9 → 10 Mbps) and 8% on 1080p60 (12 → 13 Mbps).
+`-bufsize` is 2× target. NVENC defaults to `-rc vbr` on this tier.
 
 **Color:** Rec.709 SDR. Same as consumer — prosumer doesn't need BT.2020
 unless they're stepping into broadcast tier.
@@ -129,8 +134,13 @@ on low-motion content — the broadcast tier wants the encoder that hits
 the declared rate to the bit.
 
 **Broadcast-safe limiter:** the `BroadcastSafe` flag on every broadcast
-preset tells the supervisor's filter chain to insert a `limiter=16:235`
-(luma) and `16:240` (chroma) clamp before encode. A source with
+preset tells the supervisor to insert a limiter that clamps to 16..235
+before encode (currently `-vf limiter=min=16:max=235`). Note on chroma:
+ffmpeg's `limiter` applies the same bounds to every plane by default,
+so chroma is also clamped to 16..235 today rather than the Rec.709
+chroma range of 16..240. That filter may be refined to treat chroma
+separately; check `internal/ffmpeg/config.go` for the current form. A
+source with
 out-of-range whites (a confidence monitor passing through PC-range
 graphics, a Decklink card pumping PC range) won't trip downstream QC
 systems.
@@ -166,9 +176,11 @@ never sneak into the muxer.
 | `cinema-2160p2398`      | 3840×2160  | 23.976 | 40 Mbps | 55 Mbps    |
 | `cinema-2160p24`        | 3840×2160  | 24.000 | 40 Mbps | 55 Mbps    |
 
-**Rate control:** VBR with generous headroom (2-second VBV). The
-24p cadence is forgiving on burst tolerance — there are half as many
-frames per second to cushion any one hard scene.
+**Rate control:** VBR. `-maxrate` sits 17% above target on the 1080p
+presets (12 → 14 Mbps) and 20% on the 2160p presets (40 → 48 Mbps);
+`-bufsize` is 2× target. The 24p cadence is forgiving on burst
+tolerance — there are fewer frames per second to cushion any one hard
+scene.
 
 **Color:** HD cinema stays on Rec.709; UHD cinema uses BT.2020 primaries
 with Rec.709 transfer (SDR-2020). HDR cinema would require expanding
@@ -177,10 +189,17 @@ out of scope for this revision.
 
 **Audio:** 192 kbps AAC stereo at 48 kHz.
 
-**Encoder preference:** x264 / x265 → NVENC → VideoToolbox. Software
-encoders are preferred at this tier because film grain and shallow
-depth-of-field benefit from x264's psychovisual rate-control over
-hardware encoders' simpler RC models.
+**Encoder preference:**
+
+- 1080p cinema: `libx264` → `h264_nvenc` → `h264_videotoolbox`.
+  Software is preferred at 1080p because film grain and shallow
+  depth-of-field benefit from x264's psychovisual rate control over
+  hardware encoders' simpler RC models.
+- 2160p cinema: `hevc_nvenc` → `hevc_videotoolbox` → `libx265`
+  (HEVC only, same order as `broadcast-2160p30`): hardware HEVC
+  first, `libx265` as the software fallback.
+
+No cinema preset lists QuickSync.
 
 ### Caveats
 
@@ -201,7 +220,8 @@ hardware encoders' simpler RC models.
   modes) will refuse to match the playback rate of a 23.976 stream
   on frame-accurate playback. Pick the one your source emits.
 - The recommender never silently hands a cinema preset to a generic
-  operator — `CinemaCadence` must be set on `Constraints` explicitly.
+  operator — `CinemaCadence` must be set on `Constraints` explicitly
+  (see the recommender section for what happens when it isn't).
 
 ## Recommender behaviour
 
@@ -209,45 +229,46 @@ hardware encoders' simpler RC models.
 operator's constraints. The algorithm:
 
 1. Filter by `UploadKbps` (presets with `MinUploadKbps > available`
-   drop out).
+   drop out). Zero disables this filter.
 2. Filter by `AvailableEncoders` (presets whose `RecommendedHW` list
    doesn't intersect the available list drop out).
-3. Filter by `PreferredTier` when set, or filter out cinema when the
-   operator hasn't asked for cinema cadence.
-4. If `TargetFPS` is set, prefer presets at that exact rate.
-5. Return the highest-bitrate preset in the remaining set — bitrate
-   correlates with resolution × framerate × intended quality within
-   a tier.
+3. Filter by `PreferredTier` when set.
+4. Cinema gate: with `CinemaCadence` set, only cinema presets survive;
+   without it, every cinema preset is dropped.
+5. HEVC gate (`PreferHEVC`, opt-in): presets whose `RecommendedHW` is
+   HEVC-only (`broadcast-2160p30`, `cinema-2160p2398`,
+   `cinema-2160p24`) are dropped unless `PreferHEVC` is true.
+   `PreferHEVC` only makes those presets eligible; it does not force
+   an HEVC pick when an H.264 preset scores higher. In practice the
+   2160p presets are unreachable through the recommender without it.
+6. If `TargetFPS` is set, narrow to presets at that exact rate; if
+   none match, keep the full candidate set from step 5.
+7. Return the highest-`VideoBitrate` preset in the remaining set —
+   bitrate correlates with resolution × framerate × intended quality
+   within a tier.
 
 Returns the default preset (`consumer-1080p30`) and `false` when
 nothing matches. Callers should treat the `false` case as "the
 operator can't actually run any preset; either upgrade the network
 or accept the fallback below the safety floor".
 
+**Cinema tier without cadence:** `PreferredTier: cinema` on its own
+does not select cinema. Step 3 keeps only cinema presets and step 4
+then drops them all because `CinemaCadence` is false, so the call
+falls back to `consumer-1080p30` with `false`. Set `CinemaCadence:
+true` (with or without `PreferredTier`) to get a cinema preset.
+
 ## Integration notes
 
-The preset's `BuildFFmpegArgs(p, encoder)` produces the encoder-side
-fragment of the ffmpeg argv. The supervisor (in `internal/ffmpeg/`,
-owned by a parallel agent) splices this between the input flags and
-the output muxer flags. The current `ffmpeg.go` carries a
-`// TODO(integration)` comment pointing at the exact splice site.
+The live encode path does not call `BuildFFmpegArgs`. `internal/app`
+resolves a preset ID with `quality.ResolveFFmpegPreset(id)`, which
+wraps the `Preset` in `quality.FFmpegPreset`. That adapter implements
+`ffmpeg.QualityPreset` plus the optional interfaces (color, rate
+control, broadcast-safe, audio envelope), and `internal/ffmpeg`
+builds the full argv from it. See `internal/quality/ffmpeg_adapter.go`
+and `internal/ffmpeg/config.go`.
 
-`BuildFFmpegArgs` does **not** emit:
+The old standalone `BuildFFmpegArgs` builder has been removed; the adapter
+above is the single source of truth for what a preset implies on the
+FFmpeg command line.
 
-- Input flags (`-f`, `-i`, capture format, audio device).
-- Audio encoder selection (`-c:a` — platform-dependent codec pick
-  belongs in the supervisor).
-- Output muxer flags (HLS segment options, RTMP / SRT URL).
-
-It **does** emit:
-
-- Color signalling (`-color_primaries`, `-color_trc`, `-colorspace`,
-  `-color_range`) **before** `-c:v` so hardware encoders bake VUI
-  hints into the SPS.
-- `-c:v` plus the encoder's bitrate / profile / level / rate-control
-  flags.
-- `-fps_mode cfr` and `-r preset.FPS.Expr()` to lock cadence.
-- `-pix_fmt`, `-g`, `-keyint_min` (or encoder-native equivalents).
-- `-force_key_frames` for VideoToolbox (the only reliable IDR
-  cadence on that encoder).
-- Audio rate envelope (`-b:a`, `-ar`, `-ac`).

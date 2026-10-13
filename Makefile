@@ -28,16 +28,15 @@ race: ## run the suite under -race (slower; catches data races)
 vet: ## go vet across all packages
 	go vet ./...
 
-lint: ## gofmt + go vet; fails if gofmt finds anything
+lint: ## gofmt check; fails if gofmt finds anything
 	@unformatted=$$(gofmt -l .); \
 	if [ -n "$$unformatted" ]; then \
 		echo "gofmt: the following files need formatting:"; \
 		echo "$$unformatted"; \
 		exit 1; \
 	fi
-	go vet ./...
 
 clean: ## remove the build output directory
 	rm -rf bin/
 
-check: vet race lint ## CI gate: vet + race + lint
+check: lint vet race ## CI gate: gofmt + vet + race

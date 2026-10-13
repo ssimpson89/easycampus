@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -28,17 +29,41 @@ func (s *Server) handleStreamStart(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(config.EventName) == "" {
 		config.EventName = time.Now().Format("January 02, 2006, 03:04 PM")
 	}
-	eventID := time.Now().Format("20060102_150405")
-
-	info := EventInfoFile{
-		Name:      config.EventName,
-		CreatedAt: time.Now().Format(time.RFC3339),
-		Status:    "running",
-		Type:      "recording",
+	if s.ffmpeg.IsRunning() {
+		s.writeJSON(w, http.StatusConflict, map[string]string{"detail": "stream already running"})
+		return
 	}
-	eventDir := filepath.Join(s.settings.EventsDir, eventID)
-	_ = os.MkdirAll(eventDir, 0755)
-	_ = writeEventInfo(filepath.Join(eventDir, "info.json"), info)
+	// Bail before touching disk if the client is already gone.
+	if err := r.Context().Err(); err != nil {
+		s.logger.Info("stream start aborted: client disconnected", "err", err)
+		return
+	}
+
+	// os.Mkdir under a fresh random-suffixed ID: never adopts an
+	// existing event's directory, even for two starts in one second.
+	eventID, eventDir, err := createEventDir(s.settings.EventsDir)
+	if err != nil {
+		s.logger.Warn("stream start: create event dir failed", "err", err)
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+		return
+	}
+	preset := presetFromStreamConfig(config, s.settings)
+	info := EventInfoFile{
+		Name:          config.EventName,
+		CreatedAt:     time.Now().Format(time.RFC3339),
+		Status:        "running",
+		Type:          "recording",
+		FPS:           presetFPS(preset),
+		QualityPreset: preset.ID(),
+	}
+	// info.json is written before StartStream so the supervisor's
+	// failure hook always has a file to mark "failed"; any start error
+	// removes the whole directory so no phantom "running" event remains.
+	if err := writeEventInfo(filepath.Join(eventDir, "info.json"), info); err != nil {
+		_ = os.RemoveAll(eventDir)
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+		return
+	}
 
 	s.logger.Info("stream start requested",
 		"event_id", eventID, "event_name", config.EventName,
@@ -52,10 +77,15 @@ func (s *Server) handleStreamStart(w http.ResponseWriter, r *http.Request) {
 	// instead of completing pointless work the caller has already
 	// abandoned.
 	if err := s.ffmpeg.StartStream(r.Context(), eventID, config); err != nil {
+		_ = os.RemoveAll(eventDir)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			s.logger.Info("stream start aborted: client disconnected",
 				"event_id", eventID, "err", err)
 			// Client is gone — no point writing a response body.
+			return
+		}
+		if errors.Is(err, errStreamRunning) {
+			s.writeJSON(w, http.StatusConflict, map[string]string{"detail": err.Error()})
 			return
 		}
 		s.logger.Warn("stream start failed", "event_id", eventID, "err", err)
@@ -106,7 +136,12 @@ func (s *Server) handleStreamForceStop(w http.ResponseWriter, r *http.Request) {
 	// Force-stop is a teardown path; detach from the request ctx so a
 	// client disconnect doesn't leave the supervisor half-killed.
 	killCtx := context.WithoutCancel(r.Context())
-	killed := s.ffmpeg.ForceKillPID(killCtx, req.PID)
+	killed, err := s.ffmpeg.ForceKillPID(killCtx, req.PID)
+	if errors.Is(err, errPIDNotTracked) {
+		s.logger.Warn("force stop refused: untracked pid", "pid", req.PID)
+		s.writeJSON(w, http.StatusForbidden, map[string]string{"detail": err.Error()})
+		return
+	}
 	status := s.ffmpeg.GetStatus(r.Context())
 	message := "Failed to stop stream"
 	if killed {
@@ -121,6 +156,25 @@ func (s *Server) handleStreamForceStop(w http.ResponseWriter, r *http.Request) {
 		Message:   message,
 		Stream:    status,
 	})
+}
+
+// presetFPS returns the preset's frame rate as a float, honouring
+// fractional rates like "30000/1001".
+func presetFPS(p interface {
+	FPS() int
+	FPSExpr() string
+}) float64 {
+	expr := p.FPSExpr()
+	if num, den, ok := strings.Cut(expr, "/"); ok {
+		n, err1 := strconv.ParseFloat(num, 64)
+		d, err2 := strconv.ParseFloat(den, 64)
+		if err1 == nil && err2 == nil && d != 0 {
+			return n / d
+		}
+	} else if v, err := strconv.ParseFloat(expr, 64); err == nil {
+		return v
+	}
+	return float64(p.FPS())
 }
 
 // streamConfigFromRequest translates the on-wire StreamStartRequest into

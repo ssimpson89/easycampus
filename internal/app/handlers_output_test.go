@@ -83,7 +83,7 @@ func TestHandlePlaybackProfilesRejectsNonGET(t *testing.T) {
 // initial selection.
 func TestHandlePlaybackProfilesSurfacesOperatorDefault(t *testing.T) {
 	s := newTestServerNoListener(t)
-	s.settings.PlaybackProfile = "projector-30"
+	s.setPlaybackProfile("projector-30")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/playback-profiles", nil)
 	w := httptest.NewRecorder()
@@ -106,7 +106,7 @@ func TestHandlePlaybackProfilesSurfacesOperatorDefault(t *testing.T) {
 // default — otherwise the UI would render a missing selection.
 func TestHandlePlaybackProfilesIgnoresStaleStoredDefault(t *testing.T) {
 	s := newTestServerNoListener(t)
-	s.settings.PlaybackProfile = "nope-removed-in-v2"
+	s.setPlaybackProfile("nope-removed-in-v2")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/playback-profiles", nil)
 	w := httptest.NewRecorder()
@@ -150,7 +150,7 @@ func TestResolvePlaybackProfilePrecedence(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newTestServerNoListener(t)
-			s.settings.PlaybackProfile = tc.stored
+			s.setPlaybackProfile(tc.stored)
 			got := s.resolvePlaybackProfile(tc.requested, tc.outMode, "")
 			if got.ID != tc.wantID {
 				t.Errorf("resolvePlaybackProfile(%q,%q,...).ID = %q, want %q", tc.requested, tc.outMode, got.ID, tc.wantID)
@@ -216,11 +216,11 @@ func TestHandleOutputStartPersistsProfileChoice(t *testing.T) {
 	s := newTestServerNoListener(t)
 
 	// Initial state: settings.PlaybackProfile is empty.
-	if s.settings.PlaybackProfile != "" {
-		t.Fatalf("test precondition: settings.PlaybackProfile = %q, want empty", s.settings.PlaybackProfile)
+	if got := s.currentPlaybackProfile(); got != "" {
+		t.Fatalf("test precondition: playback profile = %q, want empty", got)
 	}
 	// Simulate what the handler does on a successful start.
-	s.settings.PlaybackProfile = "projector-30"
+	s.setPlaybackProfile("projector-30")
 
 	// Now resolve with empty request and OutputMode display — should
 	// fall through to the stored value.

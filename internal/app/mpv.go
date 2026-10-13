@@ -11,27 +11,86 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
+	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"easycampus/internal/playback"
 )
 
 // MPVService owns the lifecycle of a single child mpv process for the
-// decoder node. Methods are safe under concurrent calls — the mutex
-// covers process + currentURL + socketPath bookkeeping. IPC calls dial
-// a fresh unix socket on each request (mpv accepts that trivially) so
-// concurrent property reads don't serialize through one connection.
+// decoder node. Methods are safe under concurrent calls.
+//
+// Locking: lifecycleMu serializes Start/Stop end-to-end (stop old,
+// spawn, socket wait, assign) so two concurrent Starts can never leave
+// two mpv children running. mu guards the state fields and is only held
+// briefly, so status reads / IPC calls aren't blocked behind a Start's
+// socket poll. Lock order: lifecycleMu before mu.
+//
+// IPC calls dial a fresh unix socket on each request (mpv accepts that
+// trivially) so concurrent property reads don't serialize through one
+// connection.
 type MPVService struct {
+	lifecycleMu sync.Mutex
+
 	mu         sync.Mutex
-	process    *exec.Cmd
+	proc       *mpvProc
 	socketPath string
 	currentURL string
+
+	// localRoots are the directories a non-HTTP playback path must live
+	// under (CacheDir, EventsDir).
+	localRoots []string
 	logger     *slog.Logger
 }
+
+// mpvProc is a started mpv child plus its reaper. done is closed once
+// Wait has returned, so liveness is a channel check — no signal-0 probe
+// on a PID that may have been recycled, and no zombie.
+type mpvProc struct {
+	cmd  *exec.Cmd
+	done chan struct{}
+}
+
+// startReaper launches the goroutine that Waits on cmd. Must be called
+// exactly once, right after cmd.Start succeeds; nothing else may call
+// cmd.Wait / cmd.Process.Wait.
+func startReaper(cmd *exec.Cmd) *mpvProc {
+	p := &mpvProc{cmd: cmd, done: make(chan struct{})}
+	go func() {
+		_ = cmd.Wait()
+		close(p.done)
+	}()
+	return p
+}
+
+func (p *mpvProc) alive() bool {
+	if p == nil {
+		return false
+	}
+	select {
+	case <-p.done:
+		return false
+	default:
+		return true
+	}
+}
+
+// kill SIGKILLs the child and waits for the reaper to observe the exit.
+func (p *mpvProc) kill() {
+	if p == nil {
+		return
+	}
+	if p.cmd.Process != nil {
+		_ = p.cmd.Process.Kill()
+	}
+	<-p.done
+}
+
+// errInvalidPlaybackURL is returned by Start / Load for a URL that isn't
+// http(s) or a file under the cache / events directories.
+var errInvalidPlaybackURL = errors.New("url must be an http(s) URL or a file under the cache/events directories")
 
 // NewMPVService scopes the IPC socket under the per-node data dir so
 // two easycampus-go processes on the same host don't collide. Fall
@@ -44,10 +103,46 @@ func NewMPVService(settings AppSettings, logger *slog.Logger) *MPVService {
 	if settings.BaseDir == "" {
 		socketDir = os.TempDir()
 	}
+	var roots []string
+	for _, dir := range []string{settings.CacheDir, settings.EventsDir} {
+		if dir == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(dir); err == nil {
+			roots = append(roots, abs)
+		}
+	}
 	return &MPVService{
 		socketPath: filepath.Join(socketDir, "mpv.sock"),
+		localRoots: roots,
 		logger:     logger,
 	}
+}
+
+// validatePlaybackURL accepts an http(s) URL, or an absolute local path
+// that resolves under one of the configured roots. Everything else —
+// other mpv protocols (av://, lavfi, file://, ytdl), relative paths, and
+// anything that starts with "-" — is rejected.
+func (m *MPVService) validatePlaybackURL(raw string) error {
+	if raw == "" || strings.HasPrefix(raw, "-") {
+		return errInvalidPlaybackURL
+	}
+	if validHTTPURL(raw) {
+		return nil
+	}
+	if !filepath.IsAbs(raw) {
+		return errInvalidPlaybackURL
+	}
+	clean := filepath.Clean(raw)
+	for _, root := range m.localRoots {
+		rel, err := filepath.Rel(root, clean)
+		if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) ||
+			strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		return nil
+	}
+	return errInvalidPlaybackURL
 }
 
 // Start launches mpv playing the supplied URL with the given profile.
@@ -56,22 +151,27 @@ func NewMPVService(settings AppSettings, logger *slog.Logger) *MPVService {
 // see internal/playback for the catalog. Base flags (IPC socket, cache,
 // idle/pause, OSD) are merged in here regardless of profile.
 //
-// ctx bounds the *startup* path: any existing mpv is stopped first (Stop
-// honours ctx), then the new child is spawned and we poll its IPC socket
-// for up to min(5s, ctx deadline) so a client disconnect or shutdown
-// signal cuts the wait short. Once mpv is up, ctx is no longer
-// referenced — the child runs until Stop is called.
+// ctx bounds only the *startup* path: the IPC socket wait is capped at
+// min(5s, ctx deadline) and a cancelled ctx aborts it (killing the
+// half-started child). The child itself is NOT tied to ctx — it is
+// spawned with exec.Command and runs until Stop (or the next Start).
 //
 // screenIndex / fullscreen only apply to the GPU output path; the
 // decklink path ignores them (the SDI board owns the output geometry).
 func (m *MPVService) Start(ctx context.Context, url string, screenIndex int, profile playback.Profile, fullscreen bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_ = m.Stop(ctx)
+	if err := m.validatePlaybackURL(url); err != nil {
+		return err
+	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.stopLocked()
 
 	// Ensure the socket directory exists; otherwise mpv silently
 	// refuses to start the IPC server and every subsequent property
@@ -88,14 +188,12 @@ func (m *MPVService) Start(ctx context.Context, url string, screenIndex int, pro
 		outputMode = playback.OutputModeGPU
 	}
 
-	// Profile flags first (after URL + socket): --vo, --hwdec,
-	// --video-sync, --interpolation, --display-fps-override,
-	// --decklink-format (when decklink + format set). Pure projection
-	// of the profile via internal/playback.
-	args := []string{
-		url,
-		"--input-ipc-server=" + m.socketPath,
-	}
+	// Options first; the URL goes last after "--" so mpv can never parse
+	// it as an option (e.g. a URL of "--script=evil.lua").
+	args := []string{"--input-ipc-server=" + m.socketPath}
+	// Profile flags: --vo, --hwdec, --video-sync, --interpolation,
+	// --display-fps-override, --decklink-format (when decklink + format
+	// set). Pure projection of the profile via internal/playback.
 	args = append(args, profile.MPVArgs()...)
 
 	if outputMode == playback.OutputModeDecklink {
@@ -154,12 +252,11 @@ func (m *MPVService) Start(ctx context.Context, url string, screenIndex int, pro
 		)
 	}
 
-	// exec.CommandContext lets a parent ctx cancellation reap the
-	// child. Note: a nil ctx would panic, so fall back to Background.
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	cmd := exec.CommandContext(ctx, "mpv", args...)
+	args = append(args, "--", url)
+
+	// exec.Command, NOT CommandContext: the child must outlive the HTTP
+	// request that started it. ctx only bounds the socket wait below.
+	cmd := exec.Command("mpv", args...)
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -176,30 +273,24 @@ func (m *MPVService) Start(ctx context.Context, url string, screenIndex int, pro
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	proc := startReaper(cmd)
 
-	m.process = cmd
-	m.currentURL = url
 	// Poll the IPC socket until mpv is ready (or min(5s, ctx deadline)
-	// elapses). The previous implementation slept a hard 1s regardless
-	// of how fast mpv came up — on a healthy box that's an unnecessary
-	// 900ms of dead time per start; on a slow box 1s wasn't enough and
-	// the first property read failed with "connection refused".
-	//
-	// The poll exits early when mpv exits without ever creating the
-	// socket (most commonly: bad URL, missing decklink plugin) or when
-	// ctx is cancelled (client disconnect / shutdown). Per
-	// ARCHITECTURE_REVIEW.md items 4 (mpv.go) and 7 (ctx plumbing).
+	// elapses). The poll exits early when mpv exits without ever
+	// creating the socket (most commonly: bad URL, missing decklink
+	// plugin) or when ctx is cancelled (client disconnect / shutdown).
 	timeout := mpvStartTimeout(ctx, 5*time.Second)
-	if err := waitForMPVSocket(ctx, cmd, m.socketPath, timeout); err != nil {
-		// mpv hasn't come up — kill the child if it's still running
-		// so we don't leave an orphan, then surface the error.
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		m.process = nil
-		m.currentURL = ""
+	if err := waitForMPVSocket(ctx, proc.done, m.socketPath, timeout); err != nil {
+		// mpv hasn't come up — kill and reap the child so we don't
+		// leave an orphan, then surface the error.
+		proc.kill()
 		return err
 	}
+
+	m.mu.Lock()
+	m.proc = proc
+	m.currentURL = url
+	m.mu.Unlock()
 	return nil
 }
 
@@ -217,13 +308,14 @@ func mpvStartTimeout(ctx context.Context, max time.Duration) time.Duration {
 
 // waitForMPVSocket polls socketPath every 50ms for up to timeout. Returns
 // nil as soon as a connection succeeds (mpv's IPC server is ready), or
-// an error when the timeout elapses, the mpv child exits prematurely,
-// or ctx is cancelled.
+// an error when the timeout elapses, the mpv child exits prematurely
+// (exited is closed), or ctx is cancelled.
 //
 // The poll cadence is chosen so a fast-startup mpv (typically 50-150ms
 // on an SSD) is unblocked within one tick of being ready, but the loop
 // doesn't spin on the CPU for slower startups.
-func waitForMPVSocket(ctx context.Context, cmd *exec.Cmd, socketPath string, timeout time.Duration) error {
+func waitForMPVSocket(ctx context.Context, exited <-chan struct{}, socketPath string, timeout time.Duration) error {
+	errExited := errors.New("mpv exited before IPC came up")
 	deadline := time.Now().Add(timeout)
 	dialer := net.Dialer{}
 	for time.Now().Before(deadline) {
@@ -239,71 +331,53 @@ func waitForMPVSocket(ctx context.Context, cmd *exec.Cmd, socketPath string, tim
 			_ = conn.Close()
 			return nil
 		}
-		// If mpv has already exited, no amount of waiting will help.
-		// ProcessState becomes non-nil once Wait() (or the
-		// internal reaper) has observed the exit; we rely on the
-		// caller having NOT called Wait, so this catches the
-		// case where the process died on its own.
-		if cmd.ProcessState != nil {
-			return fmt.Errorf("mpv exited before IPC came up: %s", cmd.ProcessState)
-		}
-		// Ctx-aware sleep — same justification as the dial-context
-		// above: cancellation propagates within a single tick.
+		// Ctx-aware sleep that also bails as soon as the child exits —
+		// no amount of waiting helps once mpv is gone.
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-exited:
+			return errExited
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
 	return fmt.Errorf("mpv IPC did not come up within %s", timeout)
 }
 
-// Stop kills the child mpv (if any) and waits for it to exit. ctx is
-// accepted for API symmetry; the Wait is bounded by the kernel's
-// SIGKILL semantics rather than by ctx so we never leak a child even if
-// ctx is already expired.
+// Stop kills the child mpv (if any) and waits for it to be reaped. ctx
+// is accepted for API symmetry; the wait is bounded by SIGKILL semantics
+// rather than by ctx so we never leak a child even if ctx is expired.
 func (m *MPVService) Stop(ctx context.Context) error {
 	_ = ctx
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.process != nil && m.process.Process != nil {
-		_ = m.process.Process.Kill()
-		_, _ = m.process.Process.Wait()
-		m.process = nil
-	}
-	if m.socketPath != "" {
-		_ = os.Remove(m.socketPath)
-	}
-	m.currentURL = ""
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.stopLocked()
 	return nil
 }
 
-// IsRunning reports whether the child mpv process is alive. ctx is
-// accepted for API symmetry — the probe is sync (signal-0 on Unix,
-// ProcessState elsewhere) so cancellation is informational.
+// stopLocked does the work of Stop. Caller holds lifecycleMu.
+func (m *MPVService) stopLocked() {
+	m.mu.Lock()
+	proc := m.proc
+	m.proc = nil
+	m.currentURL = ""
+	m.mu.Unlock()
+
+	proc.kill()
+	if m.socketPath != "" {
+		_ = os.Remove(m.socketPath)
+	}
+}
+
+// IsRunning reports whether the child mpv process is alive, based on the
+// reaper's view of the process (so an mpv that exited on its own is
+// reported as stopped, on every platform). ctx is accepted for API
+// symmetry.
 func (m *MPVService) IsRunning(ctx context.Context) bool {
 	_ = ctx
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.process == nil || m.process.Process == nil {
-		return false
-	}
-	if m.process.ProcessState != nil && m.process.ProcessState.Exited() {
-		return false
-	}
-	if runtime.GOOS != "windows" {
-		if err := m.process.Process.Signal(syscall.Signal(0)); err != nil {
-			return false
-		}
-	}
-	// TODO(windows): proper liveness probe. The Unix branch uses
-	// signal-0 to ask the kernel if the PID is still alive; Windows
-	// has no equivalent in os.Process and we don't pull in
-	// golang.org/x/sys/windows just for this. The ProcessState check
-	// above catches the case where we've already Wait()'d the child;
-	// a hung Windows mpv that didn't get Wait()'d slips through.
-	// Per ARCHITECTURE_REVIEW.md item 4 on mpv.go IsRunning.
-	return true
+	return m.proc.alive()
 }
 
 // sendIPC dials the mpv IPC socket, writes the JSON command, optionally
@@ -446,12 +520,8 @@ func (m *MPVService) Status(ctx context.Context) MPVStatus {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	running := m.process != nil && m.process.Process != nil
-	if running && m.process.ProcessState != nil && m.process.ProcessState.Exited() {
-		running = false
-	}
 	return MPVStatus{
-		IsRunning:  running,
+		IsRunning:  m.proc.alive(),
 		CurrentURL: m.currentURL,
 		SocketPath: m.socketPath,
 	}
@@ -553,6 +623,9 @@ func (m *MPVService) Pause(ctx context.Context) error {
 }
 
 func (m *MPVService) Load(ctx context.Context, url string) error {
+	if err := m.validatePlaybackURL(url); err != nil {
+		return err
+	}
 	_, err := m.sendIPC(ctx, map[string]interface{}{"command": []interface{}{"loadfile", url}}, false)
 	if err == nil {
 		m.mu.Lock()

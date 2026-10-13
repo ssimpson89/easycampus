@@ -24,7 +24,18 @@ func (s *Server) handleCacheStart(w http.ResponseWriter, r *http.Request) {
 	// passing r.Context() here lets future per-tenant ctx values
 	// (e.g. request_id) flow through without giving the request
 	// cancellation control over the loop's lifetime.
-	s.cache.StartCaching(r.Context(), req.EventID, req.RemoteURL)
+	if !validID(req.EventID) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "invalid event_id"})
+		return
+	}
+	if !validHTTPURL(req.RemoteURL) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "remote_url must be an http(s) URL"})
+		return
+	}
+	if err := s.cache.StartCaching(r.Context(), req.EventID, req.RemoteURL); err != nil {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": err.Error()})
+		return
+	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": fmt.Sprintf("Started caching event %s", req.EventID)})
 }
 
@@ -36,6 +47,10 @@ func (s *Server) handleCacheStop(w http.ResponseWriter, r *http.Request) {
 	eventID := pathSegmentAfter(r.URL.Path, "stop")
 	if eventID == "" {
 		eventID = pathSegmentAfter(r.URL.Path, "cache")
+	}
+	if !validID(eventID) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "invalid event id"})
+		return
 	}
 	// Stop is a teardown path — detach from the request ctx so a
 	// client disconnect doesn't abort halfway through draining the
@@ -50,10 +65,17 @@ func (s *Server) handleCacheDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	eventID := pathSegmentAfter(r.URL.Path, "cache")
+	if !validID(eventID) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "invalid event id"})
+		return
+	}
 	// Detach from the request ctx for the same reason as Stop: the
 	// delete must complete (loop drain + os.RemoveAll) regardless of
 	// whether the client is still listening for the response.
-	s.cache.DeleteCache(context.WithoutCancel(r.Context()), eventID)
+	if err := s.cache.DeleteCache(context.WithoutCancel(r.Context()), eventID); err != nil {
+		s.writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+		return
+	}
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": fmt.Sprintf("Deleted cache for event %s", eventID)})
 }
 
@@ -63,8 +85,8 @@ func (s *Server) handleCacheStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	eventID := pathSegmentAfter(r.URL.Path, "cache")
-	if eventID == "" {
-		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "missing event id"})
+	if !validID(eventID) {
+		s.writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "invalid event id"})
 		return
 	}
 	status := s.cache.Status(r.Context(), eventID)

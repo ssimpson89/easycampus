@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"easycampus/internal/ui"
@@ -36,9 +37,14 @@ type ServerConfig struct {
 	// bound Slowloris-style abuse from a misconfigured operator
 	// exposing the server to the open internet.
 	ReadHeaderTimeout time.Duration
-	// ShutdownTimeout caps how long Server.Shutdown waits for in-flight
-	// HTTP requests before forcibly cancelling. Defaults to 10s.
+	// ShutdownTimeout bounds the whole Run shutdown sequence. Defaults
+	// to 10s.
 	ShutdownTimeout time.Duration
+	// HTTPDrainTimeout caps how long Server.Shutdown waits for in-flight
+	// HTTP requests before force-closing remaining connections, leaving
+	// the rest of the shutdown budget for ffmpeg/mpv/cache teardown.
+	// Defaults to 3s.
+	HTTPDrainTimeout time.Duration
 }
 
 // Server is the singular owner of every long-lived dependency. Handler
@@ -61,7 +67,23 @@ type Server struct {
 	// the requested origin back only when it matches one of these.
 	allowedOrigins []string
 
-	shutdownTimeout time.Duration
+	// csrf rejects cross-origin state-changing requests (wired in
+	// middleware()). CORS alone can't do this: a "simple" POST or a
+	// form submission from any site is sent by the browser without a
+	// preflight, so the handler would run before CORS headers matter.
+	csrf *http.CrossOriginProtection
+
+	// profileMu guards playbackProfile, the operator's last-chosen
+	// playback profile (seeded from settings.PlaybackProfile). Handlers
+	// read and write it concurrently.
+	profileMu       sync.Mutex
+	playbackProfile string
+
+	// bookmarkLocks serializes bookmarks.json read-modify-write per event.
+	bookmarkLocks keyedMutex
+
+	shutdownTimeout  time.Duration
+	httpDrainTimeout time.Duration
 }
 
 // NewServer wires the dependencies and registers routes. Returns a ready-
@@ -79,12 +101,29 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = 10 * time.Second
 	}
+	if cfg.HTTPDrainTimeout <= 0 {
+		cfg.HTTPDrainTimeout = 3 * time.Second
+	}
 
 	s := &Server{
-		settings:        settings,
-		logger:          cfg.Logger,
-		shutdownTimeout: cfg.ShutdownTimeout,
-		allowedOrigins:  computeAllowedOrigins(settings),
+		settings:         settings,
+		logger:           cfg.Logger,
+		shutdownTimeout:  cfg.ShutdownTimeout,
+		httpDrainTimeout: cfg.HTTPDrainTimeout,
+		allowedOrigins:   computeAllowedOrigins(settings),
+		playbackProfile:  settings.PlaybackProfile,
+	}
+	s.csrf = http.NewCrossOriginProtection()
+	for _, origin := range s.allowedOrigins {
+		if err := s.csrf.AddTrustedOrigin(origin); err != nil {
+			cfg.Logger.Warn("ignoring invalid allowed origin", "origin", origin, "err", err)
+		}
+	}
+
+	// A previous process that died mid-stream leaves info.json saying
+	// "running"; nothing can be live yet, so mark those stopped.
+	if n := reconcileStaleEvents(settings); n > 0 {
+		cfg.Logger.Info("marked stale running events as stopped", "count", n)
 	}
 
 	// Build the services in the order they're needed. The ffmpeg
@@ -162,8 +201,20 @@ func (s *Server) Run(ctx context.Context) error {
 // ffmpeg/mpv), then the live encoder, then the local player. Each step
 // is best-effort; errors are logged but do not abort subsequent steps.
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.logger.Info("shutdown: starting http drain", "timeout", s.shutdownTimeout)
-	httpErr := s.httpServer.Shutdown(ctx)
+	s.logger.Info("shutdown: starting http drain", "timeout", s.httpDrainTimeout)
+	// Dedicated, shorter budget for the HTTP drain so a stuck client
+	// can't consume the time the child-process teardown needs.
+	drainCtx, cancel := context.WithTimeout(ctx, s.httpDrainTimeout)
+	httpErr := s.httpServer.Shutdown(drainCtx)
+	cancel()
+	if errors.Is(httpErr, context.DeadlineExceeded) {
+		// http.Server.Shutdown never closes connections that are still
+		// in StateNew (dialed, no request yet) until they're 5s old, and
+		// waits forever on long-running handlers. Force-close whatever
+		// is left; that's the documented follow-up to a timed-out drain.
+		s.logger.Warn("shutdown: http drain timed out; force-closing connections")
+		httpErr = s.httpServer.Close()
+	}
 	if httpErr != nil {
 		s.logger.Error("shutdown: http drain failed", "err", httpErr)
 	} else {
@@ -217,10 +268,10 @@ func (s *Server) routes() http.Handler {
 
 	// Static assets: embedded via internal/ui. The handler strips the
 	// /assets/ prefix so the embed FS sees plain "encoder.js" etc.
-	assetsHandler := http.StripPrefix("/assets/", http.FileServerFS(ui.AssetsFS()))
-	mux.Handle("/assets/", assetsHandler)
+	// ui.AssetsHandler adds Cache-Control and hides directory listings.
+	mux.Handle("/assets/", http.StripPrefix("/assets/", ui.AssetsHandler()))
 	// /api/assets/ mirror for completeness; some templates relative-path.
-	mux.Handle("/api/assets/", http.StripPrefix("/api/assets/", http.FileServerFS(ui.AssetsFS())))
+	mux.Handle("/api/assets/", http.StripPrefix("/api/assets/", ui.AssetsHandler()))
 
 	// Pages.
 	mux.HandleFunc("/", s.handleRoot)
@@ -301,11 +352,13 @@ func (s *Server) registerQualityRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/quality", s.handleQualityCatalog)
 }
 
-// middleware wraps the mux with: panic recovery, structured request
-// logging, restricted CORS. The order matters — recovery is outermost
-// so a panic inside the CORS path still returns 500 + structured log.
+// middleware wraps the mux with: panic recovery, restricted CORS,
+// structured request logging, cross-origin (CSRF) protection. The order
+// matters — recovery is outermost so a panic inside the CORS path still
+// returns 500 + structured log, and CSRF sits inside logging so rejected
+// requests still show up (as 403) in the journal.
 func (s *Server) middleware(next http.Handler) http.Handler {
-	return s.recoverMiddleware(s.corsMiddleware(s.logMiddleware(next)))
+	return s.recoverMiddleware(s.corsMiddleware(s.logMiddleware(s.csrf.Handler(next))))
 }
 
 // recoverMiddleware catches handler panics and converts them into a
@@ -326,24 +379,27 @@ func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 				// we can do about that at this layer.
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte(`{"error":"internal error"}` + "\n"))
+				_, _ = w.Write([]byte(`{"detail":"internal error"}` + "\n"))
 			}
 		}()
 		next.ServeHTTP(w, r)
 	})
 }
 
-// corsMiddleware applies a restricted, allow-list CORS policy. The
-// previous implementation responded `Access-Control-Allow-Origin: *`
-// for every request including methods that mutate state (POST/DELETE).
-// That's safe for a localhost-only daemon, but the moment an operator
-// puts the encoder on a LAN any web page their browser visits can
-// issue DELETE /events/<id> and erase a recording.
+// corsMiddleware applies a restricted, allow-list CORS policy: only
+// origins in s.allowedOrigins (127.0.0.1/localhost on the listen port
+// plus AppSettings.AllowedOrigins) get Access-Control-Allow-* headers,
+// echoed back verbatim — never "*".
 //
-// We default to the configured listen port on 127.0.0.1 + localhost
-// only. Operators who need to reach the daemon from another host add
-// origins via AppSettings.AllowedOrigins. Preflight responses echo the
-// matched origin back verbatim — never "*" and never the raw header.
+// CORS only controls whether a cross-origin page may READ a response
+// (and whether non-simple requests pass preflight). It does NOT stop a
+// "simple" cross-site request (form POST, text/plain fetch, or a
+// DELETE issued via a top-level navigation trick) from reaching the
+// handler and mutating state. That protection is s.csrf
+// (http.CrossOriginProtection, trusting the same allow-list), which
+// middleware() layers in: it rejects non-safe methods whose
+// Sec-Fetch-Site / Origin say they came from another site, while
+// same-origin requests and non-browser clients (no Origin) pass.
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
@@ -406,6 +462,13 @@ type loggingResponseWriter struct {
 func (lrw *loggingResponseWriter) WriteHeader(code int) {
 	lrw.statusCode = code
 	lrw.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap exposes the underlying writer so http.ResponseController (and
+// optional interfaces like http.Flusher / io.ReaderFrom discovered
+// through it) keep working behind the logging middleware.
+func (lrw *loggingResponseWriter) Unwrap() http.ResponseWriter {
+	return lrw.ResponseWriter
 }
 
 // handleRoot redirects bare GET / to the page matching NodeType.
@@ -481,7 +544,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, payload interface{
 		s.logger.Error("writeJSON: encode failed", "err", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"error":"failed to encode response"}` + "\n"))
+		_, _ = w.Write([]byte(`{"detail":"failed to encode response"}` + "\n"))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -523,3 +586,18 @@ func computeAllowedOrigins(settings AppSettings) []string {
 
 // Settings returns a read-only copy of the loaded AppSettings.
 func (s *Server) Settings() AppSettings { return s.settings }
+
+// currentPlaybackProfile returns the operator's last-chosen playback
+// profile ID (may be empty).
+func (s *Server) currentPlaybackProfile() string {
+	s.profileMu.Lock()
+	defer s.profileMu.Unlock()
+	return s.playbackProfile
+}
+
+// setPlaybackProfile records the operator's playback profile choice.
+func (s *Server) setPlaybackProfile(id string) {
+	s.profileMu.Lock()
+	s.playbackProfile = id
+	s.profileMu.Unlock()
+}

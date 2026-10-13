@@ -74,6 +74,9 @@ type StreamStartRequest struct {
 // the seconds-into-stream field; we keep that JSON tag for compatibility
 // while exposing it as TimeSecs in Go.
 type BookmarkCreateRequest struct {
+	// ID is optional. When set it must pass validID and be unique within
+	// the event; otherwise the server allocates the next "bm_NNN".
+	ID       string  `json:"id,omitempty"`
 	Name     string  `json:"name"`
 	TimeSecs float64 `json:"time_pos"`
 	Frame    int64   `json:"frame"`
@@ -141,6 +144,9 @@ type StreamStatus struct {
 	StartedAt     time.Time `json:"started_at,omitempty"`
 	FFMpegPID     int       `json:"ffmpeg_pid,omitempty"`
 	LastError     string    `json:"last_error,omitempty"`
+	// QualityPreset is the ID of the preset the encoder is running
+	// (e.g. "broadcast-1080p60" or a synthesized "live-1080p30").
+	QualityPreset string `json:"quality_preset,omitempty"`
 }
 
 // MPVStatus is the snapshot returned by MPVService.Status. Kept tiny on
@@ -160,9 +166,13 @@ type EventInfo struct {
 	CreatedAt       time.Time  `json:"created_at"`
 	StoppedAt       *time.Time `json:"stopped_at,omitempty"`
 	DurationSeconds int        `json:"duration_seconds"`
-	SizeBytes       int64      `json:"size_bytes"`
-	StreamURL       string     `json:"stream_url,omitempty"`
-	LogURL          string     `json:"log_url,omitempty"`
+	// FPS is the recording's frame rate (from the quality preset at
+	// stream start). Zero/omitted for events that predate the field or
+	// whose rate isn't known (uploads, external sources).
+	FPS       float64 `json:"fps,omitempty"`
+	SizeBytes int64   `json:"size_bytes"`
+	StreamURL string  `json:"stream_url,omitempty"`
+	LogURL    string  `json:"log_url,omitempty"`
 }
 
 type HealthStatus struct {
@@ -189,8 +199,10 @@ type ForceStopResult struct {
 }
 
 type PlayerStartRequest struct {
-	URL            string `json:"url"`
-	ScreenIndex    int    `json:"screen_index"`
+	URL string `json:"url"`
+	// ScreenIndex is the 0-based display index. Pointer so an explicit
+	// 0 (first display) is distinguishable from "not provided".
+	ScreenIndex    *int   `json:"screen_index,omitempty"`
 	OutputMode     string `json:"output_mode"`
 	Fullscreen     bool   `json:"fullscreen"`
 	DecklinkFormat string `json:"decklink_format"`

@@ -1,10 +1,12 @@
 package app
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestBookmarkWriteAfterDeleteDoesNotResurrectEvent: once an event is
@@ -73,5 +75,107 @@ func TestReconcileJobStatusRequiresFinalizedPlaylist(t *testing.T) {
 				t.Errorf("status=%q, want %q", info.Status, tc.want)
 			}
 		})
+	}
+}
+
+// TestKeyedMutexReleasesEntries: the lock registry only holds keys in
+// active use, and mutual exclusion still holds while waiters queue.
+func TestKeyedMutexReleasesEntries(t *testing.T) {
+	var k keyedMutex
+	for i := 0; i < 100; i++ {
+		unlock := k.lock(fmt.Sprintf("evt-%d", i))
+		unlock()
+	}
+	if n := k.size(); n != 0 {
+		t.Fatalf("registry holds %d keys after all released, want 0", n)
+	}
+
+	unlock := k.lock("shared")
+	acquired := make(chan struct{})
+	go func() {
+		u := k.lock("shared")
+		close(acquired)
+		u()
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second holder acquired the lock while the first still held it")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if n := k.size(); n != 1 {
+		t.Errorf("registry holds %d keys with one holder and one waiter, want 1", n)
+	}
+	unlock()
+	unlock() // idempotent
+	<-acquired
+	waitUntil(t, func() bool { return k.size() == 0 })
+}
+
+// TestEventDeleteWaitsForInFlightBookmarkWrite exercises the race from
+// the review: a bookmark write is mid-flight (holding the per-event lock,
+// past its existence check) when DELETE arrives. DELETE must block until
+// the write finishes, then remove the directory, and the directory must
+// stay gone.
+func TestEventDeleteWaitsForInFlightBookmarkWrite(t *testing.T) {
+	s := newTestServerNoListener(t)
+	const id = "20261013_120000_fedcba"
+	dir := filepath.Join(s.settings.EventsDir, id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "info.json"), []byte(`{"id":"`+id+`","status":"completed"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a bookmark request that has taken the lock and is about
+	// to write.
+	unlock := s.bookmarkLocks.lock(id)
+
+	deleted := make(chan int, 1)
+	go func() {
+		w := serve(s, http.MethodDelete, "/api/events/"+id, "", nil)
+		deleted <- w.Code
+	}()
+
+	select {
+	case code := <-deleted:
+		unlock()
+		t.Fatalf("DELETE finished (status %d) while a bookmark write held the event lock", code)
+	case <-time.After(150 * time.Millisecond):
+	}
+	// The in-flight write completes inside the window DELETE is waiting on.
+	if err := writeBookmarks(s.settings, id, []Bookmark{{ID: "bm_001", Name: "x"}}); err != nil {
+		unlock()
+		t.Fatalf("in-flight bookmark write failed: %v", err)
+	}
+	unlock()
+
+	select {
+	case code := <-deleted:
+		if code != http.StatusNoContent {
+			t.Fatalf("DELETE status=%d, want 204", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DELETE never completed after the lock was released")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("event directory still exists after DELETE (stat err=%v)", err)
+	}
+	if err := writeBookmarks(s.settings, id, nil); err == nil {
+		t.Error("bookmark write after DELETE succeeded; want an error, not a recreated directory")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("event directory was recreated after DELETE (stat err=%v)", err)
+	}
+}
+
+func waitUntil(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met within 2s")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

@@ -200,6 +200,12 @@ func TestArgsVideoToolboxLive(t *testing.T) {
 	)
 }
 
+// TestArgsVideoToolboxUploadOmitsRealtime: even when VideoToolbox is the
+// encoder, uploads must not pass live-only flags (-realtime, soft CBR).
+// They must ALSO not pass any input -hwaccel — uploads decode in software
+// so an arbitrary source codec (AV1, VP9, exotic HEVC variants from OBS)
+// never trips a broken hw decoder claim. The encode side still uses
+// VideoToolbox via -c:v h264_videotoolbox. See EffectiveHWAccel.
 func TestArgsVideoToolboxUploadOmitsRealtime(t *testing.T) {
 	cfg := Config{
 		Binary:    "ffmpeg",
@@ -216,10 +222,11 @@ func TestArgsVideoToolboxUploadOmitsRealtime(t *testing.T) {
 	}
 	joined := strings.Join(args, " ")
 	mustContain(t, joined,
-		"-hwaccel videotoolbox",
-		"-c:v h264_videotoolbox",
+		"-c:v h264_videotoolbox", // encode-side hwaccel still kicks in
 	)
 	mustNotContain(t, joined,
+		"-hwaccel videotoolbox", // decode-side hwaccel disabled for uploads
+		"-hwaccel auto",         // ditto auto-pick
 		"-realtime 1",
 		"-constant_bit_rate 1", // soft CBR only on live; upload uses VBR
 	)
@@ -387,6 +394,34 @@ func TestPickHWAccelNoneAvailable(t *testing.T) {
 	got := PickHWAccel(nil, EncoderX264)
 	if got != HWAccelNone {
 		t.Errorf("expected HWAccelNone with no hwaccels, got %v", got)
+	}
+}
+
+// TestEffectiveHWAccelUploadModeForcesNone proves the fix for the AV1
+// upload failure: regardless of what HWAccel is configured, ModeUpload
+// always returns HWAccelNone so software decode handles arbitrary
+// source codecs. videotoolbox claiming AV1 support but failing every
+// frame is the canonical case (see ffmpeg.log of a failed upload).
+func TestEffectiveHWAccelUploadModeForcesNone(t *testing.T) {
+	cases := []HWAccel{HWAccelAuto, HWAccelVideoToolbox, HWAccelCUDA, HWAccelVAAPI, HWAccelQSV}
+	for _, hw := range cases {
+		t.Run(string(hw), func(t *testing.T) {
+			c := Config{Mode: ModeUpload, HWAccel: hw}
+			if got := c.EffectiveHWAccel(EncoderX264); got != HWAccelNone {
+				t.Errorf("upload mode with HWAccel=%v: want HWAccelNone, got %v", hw, got)
+			}
+		})
+	}
+}
+
+// TestEffectiveHWAccelLiveModeKeepsHWAccel ensures the upload-only fix
+// doesn't regress live capture, which still wants hwaccel for the camera
+// input decode path on platforms where it works (videotoolbox + USB
+// webcam on macOS, NVDEC + capture card on Linux).
+func TestEffectiveHWAccelLiveModeKeepsHWAccel(t *testing.T) {
+	c := Config{Mode: ModeLiveHLS, HWAccel: HWAccelVideoToolbox}
+	if got := c.EffectiveHWAccel(EncoderVideoToolbox); got != HWAccelVideoToolbox {
+		t.Errorf("live mode should keep VideoToolbox hwaccel, got %v", got)
 	}
 }
 

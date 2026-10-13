@@ -77,6 +77,9 @@ document.addEventListener("alpine:init", () => {
     uploadFile:    null,
     uploadStatus:  "",
     uploadProgress:0,
+    uploadIndeterminate: false, // true when ffprobe couldn't read source duration
+    uploadDetail: "",           // "frame 5400 · 30 fps · 1.02x · 03:00 / 12:34"
+    uploadFailDetail: "",       // surfaced under "Failed" so the operator knows why
     uploadEventId: "",
 
     // -------- External source form --------
@@ -948,6 +951,27 @@ document.addEventListener("alpine:init", () => {
     },
 
     async pollUploadStatus(eventId) {
+      // Status response shape:
+      //   {
+      //     event_id, status, name, type,
+      //     source_duration_secs: number,        // 0 if ffprobe failed
+      //     progress: null | {                   // null until first ffmpeg tick
+      //       percent: number,                   //   0..100, or -1 when source duration unknown
+      //       frame: int, fps: number,
+      //       speed: "1.02x",
+      //       out_time_secs: number, bitrate_kbps: number,
+      //       updated_at: RFC3339,
+      //     }
+      //   }
+      // The bar reads percent; the detail line below reads frame/fps/speed/time.
+      //
+      // Clear any leftovers from a previous upload right away so a stale
+      // failure line doesn't show between choosing a file and the first
+      // poll response.
+      this.uploadFailDetail = "";
+      this.uploadDetail = "Starting ffmpeg…";
+      this.uploadIndeterminate = true;
+      this.uploadProgress = 0;
       // A 404 right after upload can be a race with the status file
       // being written, so tolerate a few before giving up.
       let notFound = 0;
@@ -958,6 +982,8 @@ document.addEventListener("alpine:init", () => {
         } catch (e) {
           if (e.status === 404 && ++notFound >= UPLOAD_404_LIMIT) {
             this.uploadStatus = "Failed";
+            this.uploadIndeterminate = false;
+            this.uploadDetail = "";
             this.showToast("Upload status not found. The upload may have been removed.", "bad");
             return;
           }
@@ -968,18 +994,51 @@ document.addEventListener("alpine:init", () => {
         if (data?.status === "completed") {
           this.uploadStatus = "Ready";
           this.uploadProgress = 100;
+          this.uploadIndeterminate = false;
+          this.uploadDetail = "";
           await this.loadEvents();
-          setTimeout(() => { this.uploadStatus = ""; this.uploadProgress = 0; }, 3000);
+          setTimeout(() => {
+            this.uploadStatus = "";
+            this.uploadProgress = 0;
+            this.uploadDetail = "";
+          }, 3000);
           return;
         }
         if (data?.status === "failed") {
+          // Match the button's `uploadStatus !== 'Failed'` guard so the
+          // user can immediately retry without reloading the page.
           this.uploadStatus = "Failed";
+          this.uploadFailDetail = "FFmpeg exited with an error. See the server log for details.";
+          this.uploadIndeterminate = false;
+          this.uploadDetail = "";
           this.showToast("Video processing failed", "bad");
           return;
         }
+
+        // Still running: render bar + detail from data.progress.
         this.uploadStatus = "Processing video…";
-        this.uploadProgress = Math.min(data?.progress || 0, 95);
-        setTimeout(tick, 2000);
+        this.uploadFailDetail = "";
+        const p = data?.progress;
+        if (p && typeof p === "object") {
+          if (p.percent < 0) {
+            // Duration probe failed: bar is indeterminate; show frame/fps.
+            this.uploadIndeterminate = true;
+            this.uploadProgress = 0;
+          } else {
+            this.uploadIndeterminate = false;
+            // Cap at 99 until status flips to completed so we don't show
+            // 100% next to a "Processing…" label.
+            this.uploadProgress = Math.min(p.percent, 99);
+          }
+          this.uploadDetail = F.formatProgressDetail(p, data.source_duration_secs);
+        } else {
+          // Pre-first-tick: ffmpeg hasn't emitted progress yet (typical
+          // in the first ~1s). Indeterminate until data shows up.
+          this.uploadIndeterminate = true;
+          this.uploadProgress = 0;
+          this.uploadDetail = "Starting ffmpeg…";
+        }
+        setTimeout(tick, 1000); // ffmpeg emits ~1/sec; matching the cadence avoids dead frames
       };
       tick();
     },

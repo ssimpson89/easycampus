@@ -231,9 +231,25 @@
               <span x-text="uploadStatus"></span>
               <span x-show="uploadEventId" class="mono" x-text="uploadEventId"></span>
             </div>
+            <!--
+              Bar variants:
+                .progress-bar.good        — determinate (we know percent)
+                .progress-bar.indeterminate — striped/animated when source duration is unknown
+                .progress-bar.bad         — surfaced on Failed
+            -->
             <div class="progress">
-              <div class="progress-bar good" :style="`width: ${uploadProgress}%`"></div>
+              <div class="progress-bar"
+                   :class="{
+                     'good': uploadStatus !== 'Failed' && !uploadIndeterminate,
+                     'indeterminate': uploadIndeterminate && uploadStatus !== 'Failed',
+                     'bad': uploadStatus === 'Failed'
+                   }"
+                   :style="uploadIndeterminate ? '' : `width: ${uploadProgress}%`"></div>
             </div>
+            <!-- Detail line: frame · fps · speed · elapsed / total -->
+            <div x-show="uploadDetail" class="progress-detail" x-text="uploadDetail"></div>
+            <!-- Failure detail: only shown when uploadStatus === 'Failed' -->
+            <div x-show="uploadStatus === 'Failed' && uploadFailDetail" class="progress-detail bad" x-text="uploadFailDetail"></div>
           </div>
         </div>
       </section>

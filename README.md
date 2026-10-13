@@ -37,9 +37,9 @@ Logging has two independent knobs:
 ## What you'll need
 
 - A small machine for the encoder (Mac mini, a Linux box, a NUC) on the same network as the camera or capture card. A second machine for the decoder if you want local playback — Mac mini, Linux box, or anything with HDMI out and the same network. Both ends can also be the same box for testing.
-- **FFmpeg** installed and on `PATH`. `brew install ffmpeg` on macOS, `apt install ffmpeg` on Debian/Ubuntu, `dnf install ffmpeg` on Fedora, `winget install Gyan.FFmpeg` on Windows.
+- **FFmpeg** installed and on `PATH`. `brew install ffmpeg` on macOS, `apt install ffmpeg` on Debian/Ubuntu, `dnf install ffmpeg` on Fedora.
 - **MPV** on the decoder host, if you want it to drive a local display. `brew install mpv` / `apt install mpv` / `dnf install mpv`. The encoder host doesn't need it.
-- **Go 1.25.6+** to build from source (see `go.mod`). The binary is single-file once compiled. Tagged releases publish macOS and Linux (amd64, arm64) `.tar.gz` archives. Windows builds from source and works as an encoder, but projector output on a Windows decoder is not supported yet because mpv control uses a unix socket.
+- **Go 1.25.6+** to build from source (see `go.mod`). The binary is single-file once compiled. Tagged releases publish macOS and Linux (amd64, arm64) `.tar.gz` archives. Windows is not supported for now.
 
 ## Architecture
 

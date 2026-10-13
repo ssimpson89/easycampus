@@ -17,10 +17,9 @@ builds:
     flags:
       - -trimpath
     mod_timestamp: "{{ .CommitTimestamp }}"
-    # Windows is not released yet: the decoder's mpv control uses a
-    # unix socket, and mpv on Windows only speaks named pipes, so
-    # projector output can't work there. The encoder does build and run
-    # on Windows from source (GOOS=windows go build ./cmd/easycampus).
+    # Windows is not supported for now. Among other gaps, the decoder's
+    # mpv control uses a unix socket, and mpv on Windows only speaks
+    # named pipes, so projector output can't work there.
     goos:
       - darwin
       - linux

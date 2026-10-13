@@ -15,7 +15,7 @@ operators never land on a preset their network can't sustain.
 **Target operator:** volunteer, no broadcast training, follows a printed
 checklist.
 
-**Hardware:** Mac mini iGPU or low-end Windows laptop, USB webcam, single
+**Hardware:** Mac mini iGPU or low-end Linux laptop, USB webcam, single
 HDMI capture, on-board audio.
 
 **Network:** residential cable or DSL, 5–10 Mbps sustained upload.
